@@ -1,0 +1,5 @@
+.venvdocker-compose up --build -d
+__pycache__/
+.env
+portfolio.json
+.git

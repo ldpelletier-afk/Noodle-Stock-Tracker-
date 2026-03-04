@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  webapp:
+    build: .
+    container_name: stock_tracker_ui
+    command: streamlit run "Stock Tracker.py"
+    volumes:
+      - .:/app
+    ports:
+      - "8501:8501"
+    restart: always
+
+  watcher:
+    build: .
+    container_name: stock_tracker_watcher
+    command: python "Stock Watcher.py"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    restart: always
