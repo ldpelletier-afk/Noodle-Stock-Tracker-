@@ -3,19 +3,26 @@ import json
 import time
 import requests
 import os
+from dotenv import load_dotenv
+
+# --- SECURITY: Load environment variables ---
+load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- CONFIGURATION ---
-# Replace these with your actual details
-BOT_TOKEN = "8715551315:AAFh_EhKkAO5LMBZqhDlA3fkvRLLJhSbUzA"
-CHAT_ID = "8676760709"
 DATA_FILE = "portfolio.json"
 CHECK_INTERVAL = 300  # Check every 5 minutes
 
 def send_telegram_message(message):
     """Sends a message to your phone via Telegram."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Error: Telegram tokens not found in .env file.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": message
     }
     try:
@@ -26,7 +33,6 @@ def send_telegram_message(message):
 def check_prices():
     print("Watcher service active. Checking prices...")
     
-    # Reload portfolio on every loop to catch updates from the UI
     if not os.path.exists(DATA_FILE):
         return
 
@@ -34,31 +40,30 @@ def check_prices():
         with open(DATA_FILE, 'r') as f:
             portfolio = json.load(f)
     except (json.JSONDecodeError, IOError):
-        return # Skip this cycle if file is being written to
+        return 
 
-    tickers = [t for t in portfolio.keys() if portfolio[t] > 0]
+    # Look for targets in the watch_list_targets section (matching your new UI structure)
+    targets = portfolio.get("watch_list_targets", {})
+    tickers = [t for t in targets.keys() if targets[t] > 0]
+    
     if not tickers:
         return
 
-    # Fetch live prices (Batch fetch for efficiency)
     try:
-        # yfinance allows fetching multiple tickers at once string-separated
         tickers_str = " ".join(tickers)
         data = yf.Tickers(tickers_str)
         
         for ticker in tickers:
-            target = portfolio[ticker]
-            # specific handling for single vs multiple result structures
+            target = targets[ticker]
             try:
                 live_price = data.tickers[ticker].fast_info['last_price']
             except AttributeError:
-                # Fallback if structure differs for single ticker
-                 live_price = data.tickers[ticker].info['currentPrice']
+                 live_price = data.tickers[ticker].info.get('currentPrice')
 
             if live_price is not None and live_price <= target:
                 msg = f"🚨 BUY ALERT: {ticker}\nPrice: ${live_price:.2f}\nTarget: ${target:.2f}"
                 send_telegram_message(msg)
-                print(msg) # Log to Docker console
+                print(msg) 
 
     except Exception as e:
         print(f"Error fetching data: {e}")

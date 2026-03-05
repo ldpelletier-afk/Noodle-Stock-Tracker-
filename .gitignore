@@ -1,5 +1,5 @@
-.venvdocker-compose up --build -d
-__pycache__/
 .env
 portfolio.json
-.git
+.venv/
+__pycache__/
+.DS_Store
