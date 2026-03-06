@@ -7,9 +7,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
 import datetime
+from dotenv import load_dotenv
 
 # --- CONFIGURATION & STORAGE ---
 DATA_FILE = "portfolio.json"
+
+st.set_page_config(page_title="The True Oracle", layout="wide")
 
 def sanitize_ticker(ticker):
     """Converts common brokerage ticker formats to Yahoo Finance standards."""
@@ -68,18 +71,21 @@ def save_data(data):
 # --- DATA FETCHING (CACHED) ---
 @st.cache_data(ttl=60)
 def fetch_live_prices(tickers):
+    """Upgraded to fetch both price and daily % change."""
     prices = {}
     for ticker in tickers:
         if not ticker: continue
         if ticker.upper() == "CASH":
-            prices[ticker] = 1.00
+            prices[ticker] = {'price': 1.00, 'change': 0.0}
             continue
         try:
             stock = yf.Ticker(ticker)
             price = stock.fast_info.last_price
-            prices[ticker] = round(price, 2)
+            prev_close = stock.fast_info.previous_close
+            pct_change = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+            prices[ticker] = {'price': round(price, 2), 'change': round(pct_change, 2)}
         except Exception:
-            prices[ticker] = None
+            prices[ticker] = {'price': None, 'change': None}
     return prices
 
 @st.cache_data(ttl=3600) 
@@ -127,11 +133,24 @@ def fetch_dcf_data(ticker):
 def highlight_buy_zone(row):
     live = row.get('Live Price (from API)')
     target = row.get('Target Price (Self-set)')
-    if pd.isna(live) or pd.isna(target) or target == 0.0:
-        return [''] * len(row)
-    if live <= target:
-        return ['background-color: rgba(39, 174, 96, 0.3)'] * len(row)
-    return [''] * len(row)
+    change = row.get('Day Change (%)')
+    
+    styles = [''] * len(row)
+    
+    # 1. Target hit -> Entire row solid green with white text for crisp contrast
+    if pd.notna(live) and pd.notna(target) and target > 0.0 and live <= target:
+        styles = ['background-color: #28a745; color: white;'] * len(row)
+        
+    # 2. Daily Drop -> Bold Red text for the ticker and the change column
+    if pd.notna(change) and change <= -5.0:
+        change_idx = list(row.index).index('Day Change (%)')
+        ticker_idx = list(row.index).index('Ticker')
+        
+        # We append to any existing styles (like the green background) so they can stack
+        styles[change_idx] += 'color: #ff4b4b; font-weight: bold;'
+        styles[ticker_idx] += 'color: #ff4b4b; font-weight: bold;'
+        
+    return styles
 
 def format_large_number(num):
     if num is None: return "N/A"
@@ -141,7 +160,6 @@ def format_large_number(num):
     return f"{num:.2f}"
 
 # --- MAIN APP ---
-st.set_page_config(page_title="The True Oracle", layout="wide")
 st.title("The True Oracle: Valuation & Tracking")
 
 app_data = load_data()
@@ -159,9 +177,21 @@ with tab1:
     with st.spinner("Fetching live market data..."):
         live_prices = fetch_live_prices(tickers)
 
+    # --- VOLATILITY ALERT SYSTEM ---
+    crashing_assets = []
+    for t in tickers:
+        pct_drop = live_prices.get(t, {}).get('change')
+        if pct_drop is not None and pct_drop <= -5.0:
+            crashing_assets.append(f"**{t}** ({pct_drop}%)")
+    
+    if crashing_assets:
+        st.error(f"🚨 **Volatility Alert:** The following assets are down 5% or more today: {', '.join(crashing_assets)}")
+
+    # Incorporating the nested dict structure
     df_data = {
         "Ticker": tickers,
-        "Live Price (from API)": [live_prices.get(t) for t in tickers],
+        "Live Price (from API)": [live_prices.get(t, {}).get('price') for t in tickers],
+        "Day Change (%)": [live_prices.get(t, {}).get('change') for t in tickers],
         "Target Price (Self-set)": [watch_list_targets.get(t) for t in tickers]
     }
     df = pd.DataFrame(df_data)
@@ -171,11 +201,12 @@ with tab1:
 
     edited_df = st.data_editor(
         styled_df,
-        disabled=["Ticker", "Live Price (from API)"],
+        disabled=["Ticker", "Live Price (from API)", "Day Change (%)"],
         hide_index=True,
         use_container_width=True,
         column_config={
             "Live Price (from API)": st.column_config.NumberColumn(format="$%.2f"),
+            "Day Change (%)": st.column_config.NumberColumn(format="%.2f%%"),
             "Target Price (Self-set)": st.column_config.NumberColumn(format="$%.2f", step=1.0)
         }
     )
@@ -318,7 +349,6 @@ with tab1:
             else:
                 st.warning(f"Could not retrieve historical data for {selected_ticker}.")
 
-
 # ===========================
 # TAB 2: ASSET TRACKER
 # ===========================
@@ -362,11 +392,10 @@ with tab2:
     else:
         current_holdings = portfolios[selected_portfolio]
 
-    # --- 4-COLUMN CONTROL PANEL ---
     if selected_portfolio != "All Portfolios":
-        col_add, col_sell, col_cash, col_delete = st.columns(4)
+        col_add_stock, col_sell_stock, col_manage_cash, col_delete = st.columns(4)
         
-        with col_add:
+        with col_add_stock:
             with st.expander(f"Add Stock", expanded=False):
                 with st.form("add_asset_form", clear_on_submit=True):
                     asset_ticker = sanitize_ticker(st.text_input("Ticker").upper())
@@ -374,7 +403,6 @@ with tab2:
                     asset_cost = st.number_input("Avg. Cost ($)", min_value=0.0, step=0.01)
                     if st.form_submit_button("Buy"):
                         if asset_ticker and asset_ticker != "CASH" and asset_qty > 0:
-                            # If asset exists, average the cost
                             if asset_ticker in portfolios[selected_portfolio]:
                                 old_qty = portfolios[selected_portfolio][asset_ticker]['quantity']
                                 old_cost = portfolios[selected_portfolio][asset_ticker]['average_cost']
@@ -383,54 +411,44 @@ with tab2:
                                 portfolios[selected_portfolio][asset_ticker] = {"quantity": new_total_qty, "average_cost": new_avg_cost}
                             else:
                                 portfolios[selected_portfolio][asset_ticker] = {"quantity": asset_qty, "average_cost": asset_cost}
-                            
                             app_data["portfolios"] = portfolios
                             save_data(app_data)
+                            st.toast(f"Added {asset_ticker}", icon="💰")
                             st.rerun()
 
-        with col_sell:
+        with col_sell_stock:
             with st.expander(f"Sell Stock", expanded=False):
                 sellable_assets = [t for t in portfolios[selected_portfolio].keys() if t != "CASH"]
                 if sellable_assets:
                     with st.form("sell_asset_form", clear_on_submit=True):
                         sell_ticker = st.selectbox("Asset", sellable_assets)
-                        # Get current quantity to cap the sale
                         current_qty = portfolios[selected_portfolio].get(sell_ticker, {}).get("quantity", 0.0)
-                        
                         sell_qty = st.number_input("Qty to Sell", min_value=0.01, max_value=float(current_qty), step=0.01)
                         sell_price = st.number_input("Sale Price ($)", min_value=0.0, step=0.01)
-                        
                         if st.form_submit_button("Execute Sale"):
                             if sell_qty > 0 and sell_price >= 0:
                                 proceeds = sell_qty * sell_price
-                                
-                                # Deduct shares
                                 portfolios[selected_portfolio][sell_ticker]["quantity"] -= sell_qty
-                                
-                                # Garbage collection if empty
                                 if portfolios[selected_portfolio][sell_ticker]["quantity"] <= 0.0001:
                                     del portfolios[selected_portfolio][sell_ticker]
-                                
-                                # Sweep proceeds to CASH
                                 current_cash = portfolios[selected_portfolio].get("CASH", {"quantity": 0.0, "average_cost": 1.0})
                                 portfolios[selected_portfolio]["CASH"] = {
                                     "quantity": current_cash["quantity"] + proceeds,
                                     "average_cost": 1.0
                                 }
-                                
                                 app_data["portfolios"] = portfolios
                                 save_data(app_data)
-                                st.toast(f"Sold {sell_qty} shares of {sell_ticker} for ${proceeds:,.2f}", icon="🤝")
+                                st.toast(f"Sold {sell_ticker}", icon="🤝")
                                 st.rerun()
                 else:
                     st.info("No stocks to sell.")
 
-        with col_cash:
+        with col_manage_cash:
             with st.expander(f"Manage Cash", expanded=False):
                 with st.form("manage_cash_form", clear_on_submit=True):
                     cash_action = st.radio("Action", ["Deposit", "Withdraw"], horizontal=True)
                     cash_amount = st.number_input("Amount ($)", min_value=0.01, step=100.0)
-                    if st.form_submit_button("Update"):
+                    if st.form_submit_button("Update Cash"):
                         current_cash_data = portfolios[selected_portfolio].get("CASH", {"quantity": 0.0, "average_cost": 1.0})
                         new_qty = current_cash_data["quantity"] + cash_amount if cash_action == "Deposit" else max(0.0, current_cash_data["quantity"] - cash_amount)
                         portfolios[selected_portfolio]["CASH"] = {"quantity": new_qty, "average_cost": 1.0}
@@ -442,7 +460,7 @@ with tab2:
              with st.expander(f"Delete Asset", expanded=False):
                  assets_to_delete = list(portfolios[selected_portfolio].keys())
                  if assets_to_delete:
-                     del_asset = st.selectbox("Select Asset", assets_to_delete)
+                     del_asset = st.selectbox("Select Asset to Delete", assets_to_delete)
                      if st.button("Delete Permanently", type="primary"):
                          del portfolios[selected_portfolio][del_asset]
                          app_data["portfolios"] = portfolios
@@ -472,7 +490,7 @@ with tab2:
                 profit_loss = 0.0
                 pl_percent = 0.0
             else:
-                current_price = holding_prices.get(ticker, 0) or 0
+                current_price = holding_prices.get(ticker, {}).get('price', 0) or 0
                 market_value = qty * current_price
                 total_cost = qty * avg_cost
                 profit_loss = market_value - total_cost
@@ -572,26 +590,24 @@ with tab3:
     st.header("The Valuation Machine")
     st.markdown("Calculate the true Intrinsic Value of an asset based on its future cash generation capabilities, independent of market sentiment.")
     
-    col_v_input, col_v_assumptions = st.columns([1, 2])
+    st.subheader("Asset Selection")
+    val_ticker = sanitize_ticker(st.text_input("Enter Ticker to Value", value="AAPL").upper())
     
-    with col_v_input:
-        st.subheader("Asset Selection")
-        val_ticker = sanitize_ticker(st.text_input("Enter Ticker to Value", value="AAPL").upper())
-        
-        st.write("---")
-        st.markdown("**The Math:**")
-        st.markdown(r"$$PV = \sum_{t=1}^{n} \frac{FCF_t}{(1+r)^t} + \frac{TV}{(1+r)^n}$$")
-        st.caption("$FCF$ = Free Cash Flow | $r$ = Discount Rate | $TV$ = Terminal Value")
+    st.write("---")
+    st.markdown("**The Math:**")
+    st.markdown(r"$$PV = \sum_{t=1}^{n} \frac{FCF_t}{(1+r)^t} + \frac{TV}{(1+r)^n}$$")
+    st.caption("$FCF$ = Free Cash Flow | $r$ = Discount Rate | $TV$ = Terminal Value")
 
-    with col_v_assumptions:
-        st.subheader("Philosophical Assumptions")
-        c_assump1, c_assump2, c_assump3 = st.columns(3)
-        with c_assump1:
-            discount_rate = st.slider("Discount Rate (r)", min_value=0.01, max_value=0.20, value=0.10, step=0.01, help="Your required rate of return. Higher risk = higher rate.")
-        with c_assump2:
-            growth_rate = st.slider("Growth Rate (Years 1-5)", min_value=-0.10, max_value=0.50, value=0.08, step=0.01, help="Expected annual growth of Free Cash Flow.")
-        with c_assump3:
-            terminal_rate = st.slider("Terminal Growth Rate", min_value=0.01, max_value=0.05, value=0.025, step=0.005, help="Perpetual growth rate after year 5. Should roughly track GDP.")
+    st.divider()
+    
+    st.subheader("Philosophical Assumptions")
+    c_assump1, c_assump2, c_assump3 = st.columns(3)
+    with c_assump1:
+        discount_rate = st.slider("Discount Rate (r)", min_value=0.01, max_value=0.20, value=0.10, step=0.01, help="Your required rate of return. Higher risk = higher rate.")
+    with c_assump2:
+        growth_rate = st.slider("Growth Rate (Years 1-5)", min_value=-0.10, max_value=0.50, value=0.08, step=0.01, help="Expected annual growth of Free Cash Flow.")
+    with c_assump3:
+        terminal_rate = st.slider("Terminal Growth Rate", min_value=0.01, max_value=0.05, value=0.025, step=0.005, help="Perpetual growth rate after year 5. Should roughly track GDP.")
 
     if val_ticker and st.button("Calculate Intrinsic Value", use_container_width=True, type="primary"):
         with st.spinner(f"Auditing financial statements for {val_ticker}..."):
@@ -647,9 +663,7 @@ with tab4:
     st.header("Market Intelligence")
     st.markdown("Live, unfiltered news feeds extracted directly from global financial publishers.")
     
-    col_news_search, col_news_spacer = st.columns([1, 2])
-    with col_news_search:
-        news_ticker = sanitize_ticker(st.text_input("Target Asset for Reconnaissance", value="AAPL").upper())
+    news_ticker = sanitize_ticker(st.text_input("Target Asset for Reconnaissance", value="AAPL").upper())
         
     st.divider()
     
