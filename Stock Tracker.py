@@ -84,7 +84,8 @@ def save_data(data):
     with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=4)
 
 # --- SEC EDGAR INTERCEPTOR ---
-def fetch_sec_10k(ticker):
+def fetch_sec_filing(ticker, form_type="10-K"):
+    """Fetches either 10-K (Annual) or 8-K (Latest Earnings/Events)"""
     headers = {'User-Agent': 'TheTrueOracle_Quantitative_Engine info@example.com'}
     try:
         tickers_url = "https://www.sec.gov/files/company_tickers.json"
@@ -104,8 +105,8 @@ def fetch_sec_10k(ticker):
         subs_response = requests.get(subs_url, headers=headers)
         filings = subs_response.json()['filings']['recent']
         
-        for i, form_type in enumerate(filings['form']):
-            if form_type == '10-K':
+        for i, f_type in enumerate(filings['form']):
+            if f_type == form_type:
                 accession_number = filings['accessionNumber'][i].replace("-", "")
                 primary_document = filings['primaryDocument'][i]
                 doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number}/{primary_document}"
@@ -115,7 +116,7 @@ def fetch_sec_10k(ticker):
                 clean_text = soup.get_text(separator='\n', strip=True)
                 return clean_text, doc_url
                 
-        return None, "No 10-K filing found for this company in recent history."
+        return None, f"No {form_type} filing found for this company in recent history."
     except Exception as e:
         return None, f"SEC API Error: {str(e)}"
 
@@ -134,7 +135,7 @@ def fetch_financial_news(ticker):
             pub_date = item.find('pubDate').text if item.find('pubDate') is not None else 'Recent'
             articles.append({'title': title, 'link': link, 'time': pub_date, 'publisher': 'Financial Wire'})
     except Exception as e:
-        print(f"RSS Fetch Error: {e}")
+        pass
     return articles
 
 @st.cache_data(ttl=60)
@@ -648,7 +649,6 @@ with tab4:
                         try:
                             ai_prompt = f"Analyze this financial news headline for the stock {news_ticker}: '{title}'. Respond strictly in this exact format: [BULLISH/BEARISH/NEUTRAL] - [One concise sentence explanation of why]."
                             
-                            # Injecting the True Oracle persona here as well for consistency
                             oracle_persona = """You are 'The True Oracle', an elite financial AI. You must strictly obey the following rules:
 1. The Logic-First Filter: Perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions.
 2. Probabilistic Calibration: Reject binary True/False. Treat new info as Evidence updating a Prior Belief."""
@@ -771,6 +771,8 @@ with tab6:
             "M2 Money Supply (Liquidity)": "M2SL",
             "Unemployment Rate": "UNRATE",
             "10-Year Treasury Constant Maturity Rate": "DGS10",
+            "ICE BofA US High Yield Spread (Credit Risk)": "BAMLH0A0HYM2", 
+            "Federal Reserve Total Assets (System Liquidity)": "WALCL",
             "Custom Series ID...": "CUSTOM"
         }
         
@@ -809,7 +811,7 @@ with tab6:
 # ===========================
 with tab7:
     st.header("The Library (Local RAG Database)")
-    st.markdown("Inject financial PDFs and SEC filings directly into Noodle Bot's permanent memory.")
+    st.markdown("Inject financial PDFs, Annual 10-Ks, and Quarterly 8-K Earnings data directly into Noodle Bot's permanent memory.")
 
     # --- INGESTION MODULE ---
     col_pdf, col_sec = st.columns(2)
@@ -838,23 +840,26 @@ with tab7:
                             st.error(f"Failed to embed document. Error: {e}")
 
     with col_sec:
-        with st.expander("🏛️ Rip SEC 10-K (Annual Report)", expanded=False):
+        with st.expander("🏛️ Rip SEC Filings (10-K / 8-K)", expanded=False):
             sec_ticker = sanitize_ticker(st.text_input("Enter Ticker (e.g., TSLA)").upper())
-            if st.button("Fetch & Inject 10-K", type="primary", use_container_width=True) and sec_ticker:
+            sec_form_type = st.radio("Select Document Type", ["10-K (Annual Report)", "8-K (Latest Earnings/Material Events)"])
+            
+            if st.button("Fetch & Inject SEC Data", type="primary", use_container_width=True) and sec_ticker:
+                target_form = "10-K" if "10-K" in sec_form_type else "8-K"
                 
-                with st.spinner(f"Bypassing SEC EDGAR firewall to locate {sec_ticker} 10-K..."):
-                    raw_text, source_url = fetch_sec_10k(sec_ticker)
+                with st.spinner(f"Bypassing SEC EDGAR firewall to locate {sec_ticker} {target_form}..."):
+                    raw_text, source_url = fetch_sec_filing(sec_ticker, form_type=target_form)
                     
                 if raw_text is None:
                     st.error(source_url) 
                 else:
-                    file_name = f"{sec_ticker}_10K.txt"
+                    file_name = f"{sec_ticker}_{target_form}.txt"
                     file_path = os.path.join(UPLOAD_DIR, file_name)
                     
                     with open(file_path, "w", encoding="utf-8", errors="ignore") as f:
                         f.write(raw_text)
                         
-                    with st.spinner("10-K Downloaded. Stripping HTML and chunking text..."):
+                    with st.spinner(f"{target_form} Downloaded. Stripping HTML and chunking text..."):
                         loader = TextLoader(file_path, encoding="utf-8")
                         pages = loader.load()
                         
@@ -862,54 +867,63 @@ with tab7:
                         document_chunks = text_splitter.split_documents(pages)
                         
                         for chunk in document_chunks:
-                            chunk.metadata['source'] = f"SEC EDGAR 10-K: {sec_ticker}"
+                            chunk.metadata['source'] = f"SEC EDGAR {target_form}: {sec_ticker}"
                             
                     with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
                         try:
                             embedding_engine = OllamaEmbeddings(model="nomic-embed-text")
                             db = Chroma.from_documents(documents=document_chunks, embedding=embedding_engine, persist_directory=DB_DIR)
-                            st.success(f"✅ Successfully injected {sec_ticker}'s latest 10-K into the database!")
+                            st.success(f"✅ Successfully injected {sec_ticker}'s latest {target_form} into the database!")
                         except Exception as e:
-                            st.error(f"Failed to embed 10-K. Error: {e}")
+                            st.error(f"Failed to embed {target_form}. Error: {e}")
 
     st.divider()
 
     # --- INFERENCE MODULE (THE ORACLE) ---
     st.subheader("💬 Ask The Oracle")
-    st.markdown("Query your uploaded documents. Noodle Bot will synthesize an answer based on your database, current macro conditions, live news, real-time market data, AND peer group valuations.")
+    st.markdown("Query your uploaded documents. Noodle Bot will synthesize an answer based on your database, current macro conditions, live news, real-time market data, and forward-looking Wall Street consensus.")
 
-    col_q1, col_q2, col_q3 = st.columns([2, 1, 1])
+    # 1. Initialize session state to prevent the "disappearing expander" bug
+    if 'oracle_answer' not in st.session_state:
+        st.session_state['oracle_answer'] = None
+        st.session_state['oracle_sources'] = None
+
+    # 2. Input Fields
+    user_query = st.text_area("What would you like to know about your documents?", placeholder="e.g., Does management's 10-K outlook align with Wall Street's growth estimates?")
+    
+    col_q1, col_q2 = st.columns(2)
     with col_q1:
-        user_query = st.text_input("What would you like to know about your documents?", placeholder="e.g., Based on the 10-K, is Apple's valuation justified compared to its peers?")
+        context_ticker = sanitize_ticker(st.text_input("Target Ticker (Injects News, Price & Consensus)").upper())
     with col_q2:
-        context_ticker = sanitize_ticker(st.text_input("Target Ticker (News & Price)").upper())
-    with col_q3:
         peer_group_options = ["None"] + list(peer_groups.keys())
         context_group = st.selectbox("Inject Peer Group Matrix", peer_group_options)
 
-    if user_query:
-        if not os.path.exists(DB_DIR) or not os.listdir(DB_DIR):
-            st.warning("Your library is empty. Please upload a PDF or rip a 10-K first.")
+    # 3. The Manual Trigger Button
+    trigger_oracle = st.button("🔮 Consult The Oracle", type="primary", use_container_width=True)
+
+    # 4. Execution Logic (Only runs when button is physically clicked)
+    if trigger_oracle:
+        if not user_query:
+            st.warning("Please enter a question for the Oracle.")
+        elif not os.path.exists(DB_DIR) or not os.listdir(DB_DIR):
+            st.warning("Your library is empty. Please upload a PDF or rip an SEC filing first.")
         else:
-            with st.spinner("Searching the archives, querying the Federal Reserve, and intercepting market & peer data..."):
+            with st.spinner("Initializing Omni-Context Engine (Macro, Market, Peer, and Wall Street Consensus)..."):
                 try:
-                    # 1. Fetch live FRED macro data
                     macro_injection = ""
                     if fred:
                         try:
                             fed_df = fetch_macro_data("FEDFUNDS")
-                            unrate_df = fetch_macro_data("UNRATE")
-                            
+                            hy_df = fetch_macro_data("BAMLH0A0HYM2")
                             rate_val = f"{fed_df['Value'].iloc[-1]:.2f}%" if (fed_df is not None and not fed_df.empty) else "Unknown"
-                            unrate_val = f"{unrate_df['Value'].iloc[-1]:.2f}%" if (unrate_df is not None and not unrate_df.empty) else "Unknown"
-                            
-                            macro_injection = f"\nLIVE MACROECONOMIC ENVIRONMENT:\n- Current Federal Funds Rate: {rate_val}\n- Current Unemployment Rate: {unrate_val}\n"
+                            hy_val = f"{hy_df['Value'].iloc[-1]:.2f}%" if (hy_df is not None and not hy_df.empty) else "Unknown"
+                            macro_injection = f"\nLIVE MACRO & CREDIT ENVIRONMENT:\n- Current Federal Funds Rate: {rate_val}\n- High Yield Credit Spread (Corporate Stress): {hy_val}\n"
                         except:
                             pass 
 
-                    # 2. Fetch Live Market Pricing & News Data
                     news_injection = ""
                     market_injection = ""
+                    forward_injection = ""
                     if context_ticker:
                         try:
                             live_p_data = fetch_live_prices([context_ticker])
@@ -921,6 +935,14 @@ with tab7:
                             mkt_cap = format_large_number(info.get('marketCap'))
                             pe = info.get('trailingPE', 'N/A')
                             fwd_pe = info.get('forwardPE', 'N/A')
+                            
+                            target_price = info.get('targetMeanPrice', 'N/A')
+                            rec = info.get('recommendationKey', 'N/A').upper()
+                            rev_growth = info.get('revenueGrowth', 0)
+                            earn_growth = info.get('earningsGrowth', 0)
+                            
+                            rev_str = f"{rev_growth * 100:.1f}%" if rev_growth else "N/A"
+                            earn_str = f"{earn_growth * 100:.1f}%" if earn_growth else "N/A"
                             
                             trend_str = "N/A"
                             if not hist.empty and len(hist) > 20:
@@ -936,6 +958,13 @@ LIVE MARKET VALUATION FOR {context_ticker}:
 - Market Cap: {mkt_cap}
 - P/E Ratio (Trailing): {pe} | P/E Ratio (Forward): {fwd_pe}
 """
+                            forward_injection = f"""
+WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
+- Mean Target Price: ${target_price}
+- Analyst Consensus: {rec}
+- Est. Forward Revenue Growth: {rev_str}
+- Est. Forward Earnings Growth: {earn_str}
+"""
                         except Exception:
                             market_injection = f"\nLIVE MARKET VALUATION FOR {context_ticker}: Temporarily Unavailable.\n"
 
@@ -950,7 +979,6 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                         except:
                             pass
 
-                    # 3. Fetch Live Peer Group Matrix Data
                     peer_injection = ""
                     if context_group and context_group != "None":
                         try:
@@ -959,13 +987,11 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                                 p_df = fetch_peer_metrics(g_tickers)
                                 if not p_df.empty:
                                     peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}):\n"
-                                    # Manually formatting for perfect LLM readability
                                     for _, r in p_df.iterrows():
                                         peer_injection += f"- {r['Ticker']}: Price: ${r['Price']} | Trailing P/E: {r['P/E (Trailing)']} | EV/EBITDA: {r['EV/EBITDA']} | ROE: {r['ROE (%)']}% | D/E: {r['Debt/Equity']}\n"
                         except Exception:
                             peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}): Temporarily Unavailable.\n"
                 
-                    # 4. Retrieve relevant chunks from the local database
                     embedding_engine = OllamaEmbeddings(model="nomic-embed-text")
                     db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_engine)
 
@@ -976,11 +1002,11 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                     else:
                         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
                         
-                        # 5. Construct the massive, multi-agent master prompt
-                        rag_prompt = f"""You are analyzing a user query based strictly on the provided DOCUMENT CONTEXT. You MUST factor in the LIVE MACROECONOMIC ENVIRONMENT, LIVE MARKET VALUATION, LIVE PEER GROUP VALUATION MATRIX, and LIVE NEWS provided below to form a sophisticated, real-time thesis. If the document context does not contain the core factual answer, state that, but still provide analysis based on the live data if relevant.
+                        rag_prompt = f"""You are analyzing a user query based strictly on the provided DOCUMENT CONTEXT. You MUST factor in the LIVE MACRO & CREDIT ENVIRONMENT, MARKET VALUATION, WALL STREET CONSENSUS, PEER GROUP MATRIX, and LIVE NEWS provided below to form a sophisticated, forward-looking thesis designed to maximize profit and identify market mispricings.
                         
                         {macro_injection}
                         {market_injection}
+                        {forward_injection}
                         {peer_injection}
                         {news_injection}
                         
@@ -991,30 +1017,33 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                         {user_query}
                         """
                         
-                        # 6. Inject the Custom Logic-First Persona
                         oracle_persona = """You are 'The True Oracle', an elite financial AI running on a Mac M2. You must strictly obey the following rules:
 1. The Logic-First Filter: Before answering, perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions. Explicitly list hidden premises (enthymemes).
 2. Probabilistic Calibration: For empirical claims, reject binary True/False. Treat new info as Evidence updating a Prior Belief (Bayesian update). Provide estimated confidence intervals (e.g., Confidence: High, p > 0.8).
 3. Output Structuring: Define ambiguous terms immediately; use numbered steps for reasoning chains; halt and flag logical contradictions."""
 
-                        with st.spinner("🤖 Noodle Bot is synthesizing a real-time thesis..."):
+                        with st.spinner("🤖 Noodle Bot is mathematically calculating Alpha..."):
                             response = ollama.chat(model='llama3.2', messages=[
                                 {'role': 'system', 'content': oracle_persona},
                                 {'role': 'user', 'content': rag_prompt}
                             ])
                             
-                            answer = response['message']['content']
-                            
-                            st.success("### Oracle's Synthesis")
-                            st.write(answer)
-                            
-                            with st.expander("🔍 View Source Documents Used"):
-                                for i, doc in enumerate(retrieved_docs):
-                                    source_name = doc.metadata.get('source', 'Unknown Document')
-                                    clean_source = os.path.basename(source_name)
-                                    st.markdown(f"**Source {i+1}:** `{clean_source}`")
-                                    st.caption(doc.page_content)
-                                    st.write("---")
+                            # Cache the result to session state so it survives expander clicks
+                            st.session_state['oracle_answer'] = response['message']['content']
+                            st.session_state['oracle_sources'] = retrieved_docs
 
                 except Exception as e:
                     st.error(f"Error querying the database: {e}")
+
+    # 5. Render the result from the cache (Allows you to click expanders safely)
+    if st.session_state['oracle_answer']:
+        st.success("### Oracle's Synthesis")
+        st.write(st.session_state['oracle_answer'])
+        
+        with st.expander("🔍 View Source Documents Used"):
+            for i, doc in enumerate(st.session_state['oracle_sources']):
+                source_name = doc.metadata.get('source', 'Unknown Document')
+                clean_source = os.path.basename(source_name)
+                st.markdown(f"**Source {i+1}:** `{clean_source}`")
+                st.caption(doc.page_content)
+                st.write("---")
