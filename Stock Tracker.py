@@ -647,8 +647,14 @@ with tab4:
                     with st.spinner("🤖 Noodle Bot analyzing sentiment..."):
                         try:
                             ai_prompt = f"Analyze this financial news headline for the stock {news_ticker}: '{title}'. Respond strictly in this exact format: [BULLISH/BEARISH/NEUTRAL] - [One concise sentence explanation of why]."
+                            
+                            # Injecting the True Oracle persona here as well for consistency
+                            oracle_persona = """You are 'The True Oracle', an elite financial AI. You must strictly obey the following rules:
+1. The Logic-First Filter: Perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions.
+2. Probabilistic Calibration: Reject binary True/False. Treat new info as Evidence updating a Prior Belief."""
+
                             response = ollama.chat(model='llama3.2', messages=[
-                                {'role': 'system', 'content': 'You are a highly logical quantitative financial analyst. You read headlines and immediately determine if the material fact is Bullish, Bearish, or Neutral for the specified stock.'},
+                                {'role': 'system', 'content': oracle_persona},
                                 {'role': 'user', 'content': ai_prompt}
                             ])
                             ai_analysis = response['message']['content'].strip()
@@ -870,21 +876,24 @@ with tab7:
 
     # --- INFERENCE MODULE (THE ORACLE) ---
     st.subheader("💬 Ask The Oracle")
-    st.markdown("Query your uploaded documents. Noodle Bot will synthesize an answer based on your database, current macro conditions, live news, and real-time market data.")
+    st.markdown("Query your uploaded documents. Noodle Bot will synthesize an answer based on your database, current macro conditions, live news, real-time market data, AND peer group valuations.")
 
-    col_q1, col_q2 = st.columns([3, 1])
+    col_q1, col_q2, col_q3 = st.columns([2, 1, 1])
     with col_q1:
-        user_query = st.text_input("What would you like to know about your documents?", placeholder="e.g., Based on the 10-K, is Apple's current P/E ratio justified by their growth strategy?")
+        user_query = st.text_input("What would you like to know about your documents?", placeholder="e.g., Based on the 10-K, is Apple's valuation justified compared to its peers?")
     with col_q2:
-        context_ticker = sanitize_ticker(st.text_input("Target Ticker (Injects News & Live Pricing)").upper())
+        context_ticker = sanitize_ticker(st.text_input("Target Ticker (News & Price)").upper())
+    with col_q3:
+        peer_group_options = ["None"] + list(peer_groups.keys())
+        context_group = st.selectbox("Inject Peer Group Matrix", peer_group_options)
 
     if user_query:
         if not os.path.exists(DB_DIR) or not os.listdir(DB_DIR):
             st.warning("Your library is empty. Please upload a PDF or rip a 10-K first.")
         else:
-            with st.spinner("Searching the archives, querying the Federal Reserve, and intercepting market data..."):
+            with st.spinner("Searching the archives, querying the Federal Reserve, and intercepting market & peer data..."):
                 try:
-                    # 1. Fetch live FRED macro data for background injection
+                    # 1. Fetch live FRED macro data
                     macro_injection = ""
                     if fred:
                         try:
@@ -898,11 +907,10 @@ with tab7:
                         except:
                             pass 
 
-                    # 2. Fetch Live Market Pricing & News Data for injection
+                    # 2. Fetch Live Market Pricing & News Data
                     news_injection = ""
                     market_injection = ""
                     if context_ticker:
-                        # Market Data Injection (Price, P/E, Cap, Trend)
                         try:
                             live_p_data = fetch_live_prices([context_ticker])
                             p_info = live_p_data.get(context_ticker, {})
@@ -931,7 +939,6 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                         except Exception:
                             market_injection = f"\nLIVE MARKET VALUATION FOR {context_ticker}: Temporarily Unavailable.\n"
 
-                        # News Injection
                         try:
                             recent_news = fetch_financial_news(context_ticker)
                             if recent_news:
@@ -942,8 +949,23 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                                 news_injection = f"\nLIVE NEWS ENVIRONMENT FOR {context_ticker}:\n- No major institutional headlines in the last 24 hours.\n"
                         except:
                             pass
+
+                    # 3. Fetch Live Peer Group Matrix Data
+                    peer_injection = ""
+                    if context_group and context_group != "None":
+                        try:
+                            g_tickers = peer_groups[context_group]
+                            if g_tickers:
+                                p_df = fetch_peer_metrics(g_tickers)
+                                if not p_df.empty:
+                                    peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}):\n"
+                                    # Manually formatting for perfect LLM readability
+                                    for _, r in p_df.iterrows():
+                                        peer_injection += f"- {r['Ticker']}: Price: ${r['Price']} | Trailing P/E: {r['P/E (Trailing)']} | EV/EBITDA: {r['EV/EBITDA']} | ROE: {r['ROE (%)']}% | D/E: {r['Debt/Equity']}\n"
+                        except Exception:
+                            peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}): Temporarily Unavailable.\n"
                 
-                    # 3. Retrieve relevant chunks from the local database
+                    # 4. Retrieve relevant chunks from the local database
                     embedding_engine = OllamaEmbeddings(model="nomic-embed-text")
                     db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_engine)
 
@@ -954,11 +976,12 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                     else:
                         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
                         
-                        # 4. Construct the massive, multi-agent master prompt
-                        rag_prompt = f"""You are analyzing a user query based strictly on the provided DOCUMENT CONTEXT. You MUST factor in the LIVE MACROECONOMIC ENVIRONMENT, LIVE MARKET VALUATION, and LIVE NEWS provided below to form a sophisticated, real-time thesis. If the document context does not contain the core factual answer, state that, but still provide analysis based on the live data if relevant.
+                        # 5. Construct the massive, multi-agent master prompt
+                        rag_prompt = f"""You are analyzing a user query based strictly on the provided DOCUMENT CONTEXT. You MUST factor in the LIVE MACROECONOMIC ENVIRONMENT, LIVE MARKET VALUATION, LIVE PEER GROUP VALUATION MATRIX, and LIVE NEWS provided below to form a sophisticated, real-time thesis. If the document context does not contain the core factual answer, state that, but still provide analysis based on the live data if relevant.
                         
                         {macro_injection}
                         {market_injection}
+                        {peer_injection}
                         {news_injection}
                         
                         DOCUMENT CONTEXT:
@@ -968,7 +991,7 @@ LIVE MARKET VALUATION FOR {context_ticker}:
                         {user_query}
                         """
                         
-                        # 5. Inject the Custom Logic-First Persona
+                        # 6. Inject the Custom Logic-First Persona
                         oracle_persona = """You are 'The True Oracle', an elite financial AI running on a Mac M2. You must strictly obey the following rules:
 1. The Logic-First Filter: Before answering, perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions. Explicitly list hidden premises (enthymemes).
 2. Probabilistic Calibration: For empirical claims, reject binary True/False. Treat new info as Evidence updating a Prior Belief (Bayesian update). Provide estimated confidence intervals (e.g., Confidence: High, p > 0.8).
