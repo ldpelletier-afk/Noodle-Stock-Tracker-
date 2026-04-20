@@ -19,8 +19,13 @@ from langchain_community.embeddings import OllamaEmbeddings
 import requests
 from bs4 import BeautifulSoup
 
+from data_store import (
+    load_data as _load_data_sqlite,
+    save_data as _save_data_sqlite,
+    log_transaction,
+)
+
 # --- CONFIGURATION & STORAGE ---
-DATA_FILE = "portfolio.json"
 DB_DIR = "./chroma_db"
 UPLOAD_DIR = "./temp_pdfs"
 
@@ -44,74 +49,81 @@ def sanitize_ticker(ticker):
     return ticker
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f: data = json.load(f)
-            if data and isinstance(list(data.values())[0], (int, float)):
-                new_data = {"portfolios": {"My First Portfolio": {}}, "watch_list_targets": data, "peer_groups": {}}
-                save_data(new_data)
-                data = new_data
-                
-            needs_save = False
-            clean_targets = {}
-            for t, val in data.get("watch_list_targets", {}).items():
-                clean_t = sanitize_ticker(t)
-                clean_targets[clean_t] = val
-                if clean_t != t: needs_save = True
-            data["watch_list_targets"] = clean_targets
-            
-            for p_name, p_data in data.get("portfolios", {}).items():
-                clean_p_data = {}
-                for t, t_data in p_data.items():
-                    clean_t = sanitize_ticker(t)
-                    clean_p_data[clean_t] = t_data
-                    if clean_t != t: needs_save = True
-                data["portfolios"][p_name] = clean_p_data
-
-            if "peer_groups" not in data:
-                data["peer_groups"] = {
-                    "Tech Titans": ["AAPL", "MSFT", "GOOG", "META", "NVDA"],
-                    "Automakers": ["TSLA", "F", "GM", "TM"]
-                }
-                needs_save = True
-                
-            if needs_save: save_data(data)
-            return data
-        except json.JSONDecodeError: return {"portfolios": {}, "watch_list_targets": {}, "peer_groups": {}}
-    return {"portfolios": {"My First Portfolio": {}}, "watch_list_targets": {"AAPL": 250.0, "GOOG": 250.0, "TSLA": 0.0}, "peer_groups": {}}
+    return _load_data_sqlite()
 
 def save_data(data):
-    with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=4)
+    _save_data_sqlite(data)
+
+# --- RAG SINGLETONS ---
+@st.cache_resource
+def _embedding_engine():
+    return OllamaEmbeddings(model="nomic-embed-text")
+
+@st.cache_resource
+def _vector_db():
+    return Chroma(persist_directory=DB_DIR, embedding_function=_embedding_engine())
+
+def _already_ingested(doc_id: str) -> bool:
+    try:
+        existing = _vector_db().get(where={"doc_id": doc_id}, limit=1)
+        return bool(existing and existing.get("ids"))
+    except Exception:
+        return False
+
+def _ingest_chunks(chunks, doc_id: str, source_label: str) -> int:
+    for c in chunks:
+        c.metadata["doc_id"] = doc_id
+        c.metadata["source"] = source_label
+    _vector_db().add_documents(chunks)
+    return len(chunks)
 
 # --- SEC EDGAR INTERCEPTOR ---
+@st.cache_resource
+def _sec_session():
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    s = requests.Session()
+    s.headers.update({
+        'User-Agent': os.getenv('SEC_USER_AGENT', 'TheTrueOracle_Quantitative_Engine info@example.com'),
+        'Accept-Encoding': 'gzip, deflate',
+    })
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount('https://', adapter)
+    return s
+
+@st.cache_data(ttl=86400)
+def _sec_ticker_map():
+    sess = _sec_session()
+    r = sess.get("https://www.sec.gov/files/company_tickers.json", timeout=10)
+    return r.json()
+
 def fetch_sec_filing(ticker, form_type="10-K"):
     """Fetches either 10-K (Annual) or 8-K (Latest Earnings/Events)"""
-    headers = {'User-Agent': 'TheTrueOracle_Quantitative_Engine info@example.com'}
+    sess = _sec_session()
     try:
-        tickers_url = "https://www.sec.gov/files/company_tickers.json"
-        response = requests.get(tickers_url, headers=headers)
-        ticker_map = response.json()
-        
+        ticker_map = _sec_ticker_map()
+
         cik = None
         for key, company in ticker_map.items():
             if company['ticker'] == ticker.upper():
                 cik = str(company['cik_str']).zfill(10)
                 break
-                
+
         if not cik:
             return None, "Ticker not found in SEC EDGAR database."
 
         subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        subs_response = requests.get(subs_url, headers=headers)
+        subs_response = sess.get(subs_url, timeout=10)
         filings = subs_response.json()['filings']['recent']
-        
+
         for i, f_type in enumerate(filings['form']):
             if f_type == form_type:
                 accession_number = filings['accessionNumber'][i].replace("-", "")
                 primary_document = filings['primaryDocument'][i]
                 doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number}/{primary_document}"
-                
-                doc_response = requests.get(doc_url, headers=headers)
+
+                doc_response = sess.get(doc_url, timeout=15)
                 soup = BeautifulSoup(doc_response.content, "html.parser")
                 clean_text = soup.get_text(separator='\n', strip=True)
                 return clean_text, doc_url
@@ -141,15 +153,27 @@ def fetch_financial_news(ticker):
 @st.cache_data(ttl=60)
 def fetch_live_prices(tickers):
     prices = {}
+    real_tickers = []
     for ticker in tickers:
         if not ticker: continue
         if ticker.upper() == "CASH":
             prices[ticker] = {'price': 1.00, 'change': 0.0}
             continue
+        real_tickers.append(ticker)
+
+    if not real_tickers:
+        return prices
+
+    try:
+        batch = yf.Tickers(" ".join(real_tickers))
+    except Exception:
+        batch = None
+
+    for ticker in real_tickers:
         try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            prev_close = stock.fast_info.previous_close
+            fast = batch.tickers[ticker].fast_info if batch else yf.Ticker(ticker).fast_info
+            price = fast["last_price"]
+            prev_close = fast["previous_close"]
             pct_change = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
             prices[ticker] = {'price': round(price, 2), 'change': round(pct_change, 2)}
         except Exception:
@@ -187,11 +211,18 @@ def fetch_dcf_data(ticker):
 
 @st.cache_data(ttl=3600)
 def fetch_peer_metrics(tickers):
+    real_tickers = [t for t in tickers if t]
+    if not real_tickers:
+        return pd.DataFrame()
+    try:
+        batch = yf.Tickers(" ".join(real_tickers))
+    except Exception:
+        batch = None
+
     data = []
-    for t in tickers:
-        if not t: continue
+    for t in real_tickers:
         try:
-            info = yf.Ticker(t).info
+            info = batch.tickers[t].info if batch else yf.Ticker(t).info
             data.append({
                 "Ticker": t,
                 "Price": info.get("currentPrice") or info.get("previousClose"),
@@ -449,7 +480,9 @@ with tab2:
                                 portfolios[selected_portfolio][asset_ticker] = {"quantity": old_qty + asset_qty, "average_cost": ((old_qty * old_cost) + (asset_qty * asset_cost)) / (old_qty + asset_qty)}
                             else: portfolios[selected_portfolio][asset_ticker] = {"quantity": asset_qty, "average_cost": asset_cost}
                             app_data["portfolios"] = portfolios
-                            save_data(app_data); st.toast(f"Added {asset_ticker}", icon="💰"); st.rerun()
+                            save_data(app_data)
+                            log_transaction(selected_portfolio, asset_ticker, "BUY", asset_qty, asset_cost)
+                            st.toast(f"Added {asset_ticker}", icon="💰"); st.rerun()
 
         with col_sell_stock:
             with st.expander(f"Sell Stock", expanded=False):
@@ -468,7 +501,9 @@ with tab2:
                                 current_cash = portfolios[selected_portfolio].get("CASH", {"quantity": 0.0, "average_cost": 1.0})
                                 portfolios[selected_portfolio]["CASH"] = {"quantity": current_cash["quantity"] + proceeds, "average_cost": 1.0}
                                 app_data["portfolios"] = portfolios
-                                save_data(app_data); st.toast(f"Sold {sell_ticker}", icon="🤝"); st.rerun()
+                                save_data(app_data)
+                                log_transaction(selected_portfolio, sell_ticker, "SELL", sell_qty, sell_price)
+                                st.toast(f"Sold {sell_ticker}", icon="🤝"); st.rerun()
                 else: st.info("No stocks to sell.")
 
         with col_manage_cash:
@@ -821,23 +856,27 @@ with tab7:
             uploaded_file = st.file_uploader("Upload Financial Document", type="pdf")
             if uploaded_file is not None:
                 if st.button("Process PDF", type="primary", use_container_width=True):
-                    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+                    safe_name = os.path.basename(uploaded_file.name)
+                    file_path = os.path.join(UPLOAD_DIR, safe_name)
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
-                        
-                    with st.spinner("Extracting text and chunking document..."):
-                        loader = PyMuPDFLoader(file_path)
-                        pages = loader.load()
-                        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-                        document_chunks = text_splitter.split_documents(pages)
-                        
-                    with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
-                        try:
-                            embedding_engine = OllamaEmbeddings(model="nomic-embed-text")
-                            db = Chroma.from_documents(documents=document_chunks, embedding=embedding_engine, persist_directory=DB_DIR)
-                            st.success(f"✅ Injected '{uploaded_file.name}' into the database!")
-                        except Exception as e:
-                            st.error(f"Failed to embed document. Error: {e}")
+
+                    doc_id = f"pdf::{safe_name}"
+                    if _already_ingested(doc_id):
+                        st.info(f"'{safe_name}' is already in the library — skipping re-embed.")
+                    else:
+                        with st.spinner("Extracting text and chunking document..."):
+                            loader = PyMuPDFLoader(file_path)
+                            pages = loader.load()
+                            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                            document_chunks = text_splitter.split_documents(pages)
+
+                        with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
+                            try:
+                                n = _ingest_chunks(document_chunks, doc_id, f"PDF: {safe_name}")
+                                st.success(f"✅ Injected '{safe_name}' ({n} chunks) into the database!")
+                            except Exception as e:
+                                st.error(f"Failed to embed document. Error: {e}")
 
     with col_sec:
         with st.expander("🏛️ Rip SEC Filings (10-K / 8-K)", expanded=False):
@@ -851,31 +890,32 @@ with tab7:
                     raw_text, source_url = fetch_sec_filing(sec_ticker, form_type=target_form)
                     
                 if raw_text is None:
-                    st.error(source_url) 
+                    st.error(source_url)
                 else:
-                    file_name = f"{sec_ticker}_{target_form}.txt"
-                    file_path = os.path.join(UPLOAD_DIR, file_name)
-                    
-                    with open(file_path, "w", encoding="utf-8", errors="ignore") as f:
-                        f.write(raw_text)
-                        
-                    with st.spinner(f"{target_form} Downloaded. Stripping HTML and chunking text..."):
-                        loader = TextLoader(file_path, encoding="utf-8")
-                        pages = loader.load()
-                        
-                        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
-                        document_chunks = text_splitter.split_documents(pages)
-                        
-                        for chunk in document_chunks:
-                            chunk.metadata['source'] = f"SEC EDGAR {target_form}: {sec_ticker}"
-                            
-                    with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
-                        try:
-                            embedding_engine = OllamaEmbeddings(model="nomic-embed-text")
-                            db = Chroma.from_documents(documents=document_chunks, embedding=embedding_engine, persist_directory=DB_DIR)
-                            st.success(f"✅ Successfully injected {sec_ticker}'s latest {target_form} into the database!")
-                        except Exception as e:
-                            st.error(f"Failed to embed {target_form}. Error: {e}")
+                    doc_id = f"sec::{sec_ticker}::{target_form}"
+                    if _already_ingested(doc_id):
+                        st.info(f"{sec_ticker}'s {target_form} is already in the library — skipping re-embed.")
+                    else:
+                        file_name = f"{sec_ticker}_{target_form}.txt"
+                        file_path = os.path.join(UPLOAD_DIR, file_name)
+                        with open(file_path, "w", encoding="utf-8", errors="ignore") as f:
+                            f.write(raw_text)
+
+                        with st.spinner(f"{target_form} Downloaded. Chunking text..."):
+                            loader = TextLoader(file_path, encoding="utf-8")
+                            pages = loader.load()
+                            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
+                            document_chunks = text_splitter.split_documents(pages)
+                            for chunk in document_chunks:
+                                chunk.metadata['ticker'] = sec_ticker
+                                chunk.metadata['form'] = target_form
+
+                        with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
+                            try:
+                                n = _ingest_chunks(document_chunks, doc_id, f"SEC EDGAR {target_form}: {sec_ticker}")
+                                st.success(f"✅ Successfully injected {sec_ticker}'s {target_form} ({n} chunks)!")
+                            except Exception as e:
+                                st.error(f"Failed to embed {target_form}. Error: {e}")
 
     st.divider()
 
@@ -992,11 +1032,19 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
                         except Exception:
                             peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}): Temporarily Unavailable.\n"
                 
-                    embedding_engine = OllamaEmbeddings(model="nomic-embed-text")
-                    db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_engine)
+                    db = _vector_db()
 
-                    retrieved_docs = db.similarity_search(user_query, k=4)
-                    
+                    retrieved_docs = []
+                    if context_ticker:
+                        try:
+                            retrieved_docs = db.similarity_search(
+                                user_query, k=6, filter={"ticker": context_ticker}
+                            )
+                        except Exception:
+                            retrieved_docs = []
+                    if not retrieved_docs:
+                        retrieved_docs = db.similarity_search(user_query, k=6)
+
                     if not retrieved_docs:
                         st.info("No relevant information found in your documents.")
                     else:
@@ -1022,24 +1070,33 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
 2. Probabilistic Calibration: For empirical claims, reject binary True/False. Treat new info as Evidence updating a Prior Belief (Bayesian update). Provide estimated confidence intervals (e.g., Confidence: High, p > 0.8).
 3. Output Structuring: Define ambiguous terms immediately; use numbered steps for reasoning chains; halt and flag logical contradictions."""
 
-                        with st.spinner("🤖 Noodle Bot is mathematically calculating Alpha..."):
-                            response = ollama.chat(model='llama3.2', messages=[
-                                {'role': 'system', 'content': oracle_persona},
-                                {'role': 'user', 'content': rag_prompt}
-                            ])
-                            
-                            # Cache the result to session state so it survives expander clicks
-                            st.session_state['oracle_answer'] = response['message']['content']
-                            st.session_state['oracle_sources'] = retrieved_docs
+                        st.success("### Oracle's Synthesis")
+
+                        def _stream_oracle():
+                            for chunk in ollama.chat(
+                                model='llama3.2',
+                                messages=[
+                                    {'role': 'system', 'content': oracle_persona},
+                                    {'role': 'user', 'content': rag_prompt},
+                                ],
+                                stream=True,
+                            ):
+                                yield chunk['message']['content']
+
+                        full_answer = st.write_stream(_stream_oracle())
+                        st.session_state['oracle_answer'] = full_answer
+                        st.session_state['oracle_sources'] = retrieved_docs
 
                 except Exception as e:
                     st.error(f"Error querying the database: {e}")
 
     # 5. Render the result from the cache (Allows you to click expanders safely)
-    if st.session_state['oracle_answer']:
+    # Skip on the streaming turn — we already rendered the answer live.
+    if st.session_state['oracle_answer'] and not trigger_oracle:
         st.success("### Oracle's Synthesis")
         st.write(st.session_state['oracle_answer'])
-        
+
+    if st.session_state['oracle_answer']:
         with st.expander("🔍 View Source Documents Used"):
             for i, doc in enumerate(st.session_state['oracle_sources']):
                 source_name = doc.metadata.get('source', 'Unknown Document')

@@ -1,5 +1,10 @@
 .env
 portfolio.json
+portfolio.json.migrated
+portfolio.db
+portfolio.db-journal
+portfolio.db-wal
+portfolio.db-shm
 .venv/
 __pycache__/
 .DS_Store
