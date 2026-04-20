@@ -21,6 +21,7 @@ from api import (
 )
 from data_store import (
     fetch_transactions,
+    import_transactions,
     load_data as _load_data_sqlite,
     log_transaction,
     save_data as _save_data_sqlite,
@@ -379,6 +380,73 @@ with tab2:
 with tab_hist:
     st.header("📒 Trade History & Realized P&L")
     st.caption("Every buy and sell you make is recorded here. Realized P&L is calculated from sales only — unrealized gains on open positions are shown in the Asset Tracker.")
+
+    # --- IMPORT HISTORICAL TRADES ---
+    with st.expander("📥 Import Historical Trades (CSV)", expanded=False):
+        st.markdown(
+            "Backfill trades from before the SQLite migration — or from any broker export.\n\n"
+            "**Required columns:** `date`, `portfolio`, `ticker`, `action` (BUY or SELL), `quantity`, `price`.\n"
+            "**Optional:** `cost_basis` — only meaningful for SELL rows. If omitted on a SELL, that row won't contribute to realized P&L (but still appears in the ledger)."
+        )
+
+        template_csv = (
+            "date,portfolio,ticker,action,quantity,price,cost_basis\n"
+            "2024-03-15,RobinHood,AAPL,BUY,10,172.50,\n"
+            "2024-08-02,RobinHood,AAPL,SELL,4,225.00,172.50\n"
+        )
+        st.download_button(
+            "Download CSV template",
+            data=template_csv,
+            file_name="trades_template.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
+
+        uploaded_csv = st.file_uploader("Upload your CSV", type=["csv"], key="tx_import")
+        if uploaded_csv is not None:
+            try:
+                import_df = pd.read_csv(uploaded_csv)
+            except Exception as e:
+                st.error(f"Could not read CSV: {e}")
+                import_df = None
+
+            if import_df is not None:
+                required = {"date", "portfolio", "ticker", "action", "quantity", "price"}
+                missing = required - set(c.lower() for c in import_df.columns)
+                import_df.columns = [c.lower() for c in import_df.columns]
+                if missing:
+                    st.error(f"Missing required columns: {', '.join(sorted(missing))}")
+                else:
+                    st.write("**Preview** (first 10 rows):")
+                    st.dataframe(import_df.head(10), use_container_width=True, hide_index=True)
+
+                    if st.button("Import Trades", type="primary"):
+                        rows = []
+                        parse_errors = 0
+                        for _, r in import_df.iterrows():
+                            try:
+                                ts = int(pd.to_datetime(r["date"]).timestamp())
+                                rows.append({
+                                    "ts": ts,
+                                    "portfolio_name": str(r["portfolio"]).strip(),
+                                    "ticker": str(r["ticker"]).strip().upper(),
+                                    "action": str(r["action"]).strip().upper(),
+                                    "quantity": float(r["quantity"]),
+                                    "price": float(r["price"]),
+                                    "cost_basis": r.get("cost_basis") if "cost_basis" in import_df.columns else None,
+                                })
+                            except Exception:
+                                parse_errors += 1
+
+                        result = import_transactions(rows)
+                        result["errors"] += parse_errors
+                        st.success(
+                            f"✅ Imported {result['added']} trades. "
+                            f"Skipped {result['skipped']} duplicates. "
+                            f"{result['errors']} rows had errors."
+                        )
+
+    st.divider()
 
     all_tx = fetch_transactions()
 

@@ -309,6 +309,61 @@ def log_transaction(
         )
 
 
+def import_transactions(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Bulk-insert transactions. Rows must have keys:
+    ts (int epoch), portfolio_name, ticker, action (BUY|SELL), quantity, price.
+    Optional: cost_basis.
+
+    Returns {"added": int, "skipped": int, "errors": int}. Duplicates (same
+    ts, portfolio, ticker, action, quantity, price) are skipped.
+    """
+    init_db()
+    added = skipped = errors = 0
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for r in rows:
+                try:
+                    ts = int(r["ts"])
+                    portfolio = str(r["portfolio_name"])
+                    ticker = _sanitize_ticker(str(r["ticker"]))
+                    action = str(r["action"]).upper()
+                    qty = float(r["quantity"])
+                    price = float(r["price"])
+                    cb = r.get("cost_basis")
+                    cb = float(cb) if cb not in (None, "", "nan") else None
+                except Exception:
+                    errors += 1
+                    continue
+
+                if action not in ("BUY", "SELL"):
+                    errors += 1
+                    continue
+
+                dup = conn.execute(
+                    """SELECT 1 FROM transactions
+                       WHERE ts=? AND portfolio_name=? AND ticker=?
+                         AND action=? AND quantity=? AND price=? LIMIT 1""",
+                    (ts, portfolio, ticker, action, qty, price),
+                ).fetchone()
+                if dup:
+                    skipped += 1
+                    continue
+
+                conn.execute(
+                    """INSERT INTO transactions
+                         (ts, portfolio_name, ticker, action, quantity, price, cost_basis)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (ts, portfolio, ticker, action, qty, price, cb),
+                )
+                added += 1
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return {"added": added, "skipped": skipped, "errors": errors}
+
+
 def fetch_transactions(portfolio_name: str | None = None) -> list[dict[str, Any]]:
     init_db()
     with _connect() as conn:
