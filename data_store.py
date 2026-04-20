@@ -53,6 +53,16 @@ def _connect():
         conn.close()
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "transactions", "cost_basis"):
+        conn.execute("ALTER TABLE transactions ADD COLUMN cost_basis REAL")
+
+
 def _create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -92,7 +102,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             ticker TEXT NOT NULL,
             action TEXT NOT NULL,
             quantity REAL NOT NULL,
-            price REAL NOT NULL
+            price REAL NOT NULL,
+            cost_basis REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_transactions_portfolio
@@ -174,6 +185,7 @@ def init_db() -> None:
             return
         with _connect() as conn:
             _create_schema(conn)
+            _apply_migrations(conn)
             _migrate_from_json(conn)
             _maybe_seed_defaults(conn)
         _initialized = True
@@ -277,13 +289,14 @@ def log_transaction(
     action: str,
     quantity: float,
     price: float,
+    cost_basis: float | None = None,
     ts: int | None = None,
 ) -> None:
     init_db()
     with _connect() as conn:
         conn.execute(
-            """INSERT INTO transactions(ts, portfolio_name, ticker, action, quantity, price)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO transactions(ts, portfolio_name, ticker, action, quantity, price, cost_basis)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(ts if ts is not None else time.time()),
                 portfolio_name,
@@ -291,6 +304,7 @@ def log_transaction(
                 action.upper(),
                 float(quantity),
                 float(price),
+                float(cost_basis) if cost_basis is not None else None,
             ),
         )
 
@@ -300,13 +314,13 @@ def fetch_transactions(portfolio_name: str | None = None) -> list[dict[str, Any]
     with _connect() as conn:
         if portfolio_name:
             rows = conn.execute(
-                """SELECT id, ts, portfolio_name, ticker, action, quantity, price
+                """SELECT id, ts, portfolio_name, ticker, action, quantity, price, cost_basis
                    FROM transactions WHERE portfolio_name = ? ORDER BY ts DESC""",
                 (portfolio_name,),
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT id, ts, portfolio_name, ticker, action, quantity, price
+                """SELECT id, ts, portfolio_name, ticker, action, quantity, price, cost_basis
                    FROM transactions ORDER BY ts DESC"""
             ).fetchall()
     return [dict(r) for r in rows]
