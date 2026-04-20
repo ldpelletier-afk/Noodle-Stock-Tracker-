@@ -23,6 +23,7 @@ from data_store import (
     load_data as _load_data_sqlite,
     save_data as _save_data_sqlite,
     log_transaction,
+    fetch_transactions,
 )
 
 # --- CONFIGURATION & STORAGE ---
@@ -282,8 +283,8 @@ portfolios = app_data.get("portfolios", {})
 watch_list_targets = app_data.get("watch_list_targets", {})
 peer_groups = app_data.get("peer_groups", {})
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📈 Market Watch", "💼 Asset Tracker", "⚖️ Valuation", 
+tab1, tab2, tab_hist, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📈 Market Watch", "💼 Asset Tracker", "📒 History", "⚖️ Valuation",
     "📰 Intelligence", "🏢 Peer Matrix", "🏦 Macro", "📚 The Library"
 ])
 
@@ -481,7 +482,7 @@ with tab2:
                             else: portfolios[selected_portfolio][asset_ticker] = {"quantity": asset_qty, "average_cost": asset_cost}
                             app_data["portfolios"] = portfolios
                             save_data(app_data)
-                            log_transaction(selected_portfolio, asset_ticker, "BUY", asset_qty, asset_cost)
+                            log_transaction(selected_portfolio, asset_ticker, "BUY", asset_qty, asset_cost, cost_basis=asset_cost)
                             st.toast(f"Added {asset_ticker}", icon="💰"); st.rerun()
 
         with col_sell_stock:
@@ -495,6 +496,7 @@ with tab2:
                         sell_price = st.number_input("Sale Price ($)", min_value=0.0, step=0.01)
                         if st.form_submit_button("Execute Sale"):
                             if sell_qty > 0 and sell_price >= 0:
+                                avg_cost_at_sale = portfolios[selected_portfolio][sell_ticker]["average_cost"]
                                 proceeds = sell_qty * sell_price
                                 portfolios[selected_portfolio][sell_ticker]["quantity"] -= sell_qty
                                 if portfolios[selected_portfolio][sell_ticker]["quantity"] <= 0.0001: del portfolios[selected_portfolio][sell_ticker]
@@ -502,7 +504,7 @@ with tab2:
                                 portfolios[selected_portfolio]["CASH"] = {"quantity": current_cash["quantity"] + proceeds, "average_cost": 1.0}
                                 app_data["portfolios"] = portfolios
                                 save_data(app_data)
-                                log_transaction(selected_portfolio, sell_ticker, "SELL", sell_qty, sell_price)
+                                log_transaction(selected_portfolio, sell_ticker, "SELL", sell_qty, sell_price, cost_basis=avg_cost_at_sale)
                                 st.toast(f"Sold {sell_ticker}", icon="🤝"); st.rerun()
                 else: st.info("No stocks to sell.")
 
@@ -598,6 +600,108 @@ with tab2:
                     fig_tree.update_layout(margin=dict(t=10, l=10, r=10, b=10))
                     st.plotly_chart(fig_tree, use_container_width=True)
     else: st.info("No assets in this portfolio yet.")
+
+# ===========================
+# TAB HISTORY: TRADE LEDGER & REALIZED P&L
+# ===========================
+with tab_hist:
+    st.header("📒 Trade History & Realized P&L")
+    st.caption("Every buy and sell you make is recorded here. Realized P&L is calculated from sales only — unrealized gains on open positions are shown in the Asset Tracker.")
+
+    all_tx = fetch_transactions()
+
+    if not all_tx:
+        st.info("No trades logged yet. Buy or sell a position from the Asset Tracker and it will appear here.")
+    else:
+        tx_df = pd.DataFrame(all_tx)
+        tx_df["Date"] = pd.to_datetime(tx_df["ts"], unit="s")
+        tx_df["Year"] = tx_df["Date"].dt.year
+        tx_df["Proceeds"] = tx_df["quantity"] * tx_df["price"]
+        tx_df["Realized P&L"] = tx_df.apply(
+            lambda r: (r["price"] - r["cost_basis"]) * r["quantity"]
+            if r["action"] == "SELL" and pd.notna(r["cost_basis"])
+            else 0.0,
+            axis=1,
+        )
+
+        sells = tx_df[tx_df["action"] == "SELL"]
+        total_realized = sells["Realized P&L"].sum()
+        ytd = sells[sells["Year"] == pd.Timestamp.now().year]["Realized P&L"].sum()
+        trade_count = len(tx_df)
+        win_count = int((sells["Realized P&L"] > 0).sum())
+        loss_count = int((sells["Realized P&L"] < 0).sum())
+        win_rate = (win_count / len(sells) * 100) if len(sells) else 0.0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Realized P&L", f"${total_realized:,.2f}")
+        m2.metric(f"{pd.Timestamp.now().year} Realized P&L", f"${ytd:,.2f}")
+        m3.metric("Total Trades", f"{trade_count}")
+        m4.metric("Win Rate", f"{win_rate:.0f}%", help=f"{win_count} wins / {loss_count} losses")
+
+        st.divider()
+
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            portfolio_filter = st.selectbox(
+                "Filter by Portfolio",
+                ["All"] + sorted(tx_df["portfolio_name"].unique().tolist()),
+            )
+        with col_f2:
+            ticker_filter = st.selectbox(
+                "Filter by Ticker",
+                ["All"] + sorted(tx_df["ticker"].unique().tolist()),
+            )
+
+        view_df = tx_df.copy()
+        if portfolio_filter != "All":
+            view_df = view_df[view_df["portfolio_name"] == portfolio_filter]
+        if ticker_filter != "All":
+            view_df = view_df[view_df["ticker"] == ticker_filter]
+
+        st.subheader("Transaction Log")
+        display_df = view_df[[
+            "Date", "portfolio_name", "ticker", "action", "quantity",
+            "price", "cost_basis", "Proceeds", "Realized P&L",
+        ]].rename(columns={
+            "portfolio_name": "Portfolio",
+            "ticker": "Ticker",
+            "action": "Action",
+            "quantity": "Qty",
+            "price": "Price",
+            "cost_basis": "Cost Basis",
+        })
+        st.dataframe(
+            display_df.style.format({
+                "Qty": "{:.4f}",
+                "Price": "${:,.2f}",
+                "Cost Basis": "${:,.2f}",
+                "Proceeds": "${:,.2f}",
+                "Realized P&L": "${:,.2f}",
+            }, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if not sells.empty:
+            st.subheader("Realized P&L by Ticker")
+            by_ticker = (
+                sells.groupby("ticker")["Realized P&L"].sum().reset_index()
+                .sort_values("Realized P&L", ascending=False)
+            )
+            fig_ticker = px.bar(
+                by_ticker, x="ticker", y="Realized P&L",
+                color="Realized P&L",
+                color_continuous_scale=["#ff4b4b", "#cccccc", "#28a745"],
+                color_continuous_midpoint=0,
+            )
+            fig_ticker.update_layout(height=320, margin=dict(t=10, l=10, r=10, b=10))
+            st.plotly_chart(fig_ticker, use_container_width=True)
+
+            st.subheader("Realized P&L by Year")
+            by_year = sells.groupby("Year")["Realized P&L"].sum().reset_index()
+            fig_year = px.bar(by_year, x="Year", y="Realized P&L")
+            fig_year.update_layout(height=280, margin=dict(t=10, l=10, r=10, b=10))
+            st.plotly_chart(fig_year, use_container_width=True)
 
 # ===========================
 # TAB 3: THE VALUATION MACHINE
