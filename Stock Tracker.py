@@ -112,7 +112,7 @@ with tab1:
             if new_ticker and new_ticker not in watch_list_targets:
                 watch_list_targets[new_ticker] = 0.0 
                 app_data["watch_list_targets"] = watch_list_targets
-                save_data(app_data); st.rerun() 
+                save_data(app_data)
             elif new_ticker in watch_list_targets: st.warning("Ticker already on watch list.")
                 
     with col_del:
@@ -122,7 +122,7 @@ with tab1:
             if st.button("Delete Stock", type="primary", use_container_width=True):
                 del watch_list_targets[ticker_to_remove]
                 app_data["watch_list_targets"] = watch_list_targets
-                save_data(app_data); st.toast(f"Removed {ticker_to_remove}", icon="🗑️"); st.rerun()
+                save_data(app_data); st.toast(f"Removed {ticker_to_remove}", icon="🗑️")
         else: st.info("Watch list is empty.")
 
     st.divider()
@@ -133,7 +133,7 @@ with tab1:
     with col_refresh:
         st.write(""); st.write("") 
         if st.button("🔄 Force Refresh Data", use_container_width=True):
-            fetch_stock_details.clear(); fetch_live_prices.clear(); st.rerun() 
+            fetch_stock_details.clear(); fetch_live_prices.clear()
 
     timeframes = ["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "Max"]
     selected_period = st.radio("Timeframe", timeframes, index=2, horizontal=True)
@@ -214,7 +214,7 @@ with tab2:
             if new_portfolio_name and new_portfolio_name not in portfolios:
                 portfolios[new_portfolio_name] = {}
                 app_data["portfolios"] = portfolios
-                save_data(app_data); st.toast(f"Portfolio '{new_portfolio_name}' created!", icon="🎉"); st.rerun()
+                save_data(app_data); st.toast(f"Portfolio '{new_portfolio_name}' created!", icon="🎉")
             elif new_portfolio_name in portfolios: st.warning("Portfolio already exists.")
     st.divider()
 
@@ -255,7 +255,7 @@ with tab2:
                             app_data["portfolios"] = portfolios
                             save_data(app_data)
                             log_transaction(selected_portfolio, asset_ticker, "BUY", asset_qty, asset_cost, cost_basis=asset_cost)
-                            st.toast(f"Added {asset_ticker}", icon="💰"); st.rerun()
+                            st.toast(f"Added {asset_ticker}", icon="💰")
 
         with col_sell_stock:
             with st.expander(f"Sell Stock", expanded=False):
@@ -277,7 +277,7 @@ with tab2:
                                 app_data["portfolios"] = portfolios
                                 save_data(app_data)
                                 log_transaction(selected_portfolio, sell_ticker, "SELL", sell_qty, sell_price, cost_basis=avg_cost_at_sale)
-                                st.toast(f"Sold {sell_ticker}", icon="🤝"); st.rerun()
+                                st.toast(f"Sold {sell_ticker}", icon="🤝")
                 else: st.info("No stocks to sell.")
 
         with col_manage_cash:
@@ -290,7 +290,7 @@ with tab2:
                         new_qty = current_cash_data["quantity"] + cash_amount if cash_action == "Deposit" else max(0.0, current_cash_data["quantity"] - cash_amount)
                         portfolios[selected_portfolio]["CASH"] = {"quantity": new_qty, "average_cost": 1.0}
                         app_data["portfolios"] = portfolios
-                        save_data(app_data); st.rerun()
+                        save_data(app_data)
 
         with col_delete:
              with st.expander(f"Delete Asset", expanded=False):
@@ -300,7 +300,7 @@ with tab2:
                      if st.button("Delete Permanently", type="primary"):
                          del portfolios[selected_portfolio][del_asset]
                          app_data["portfolios"] = portfolios
-                         save_data(app_data); st.toast(f"Deleted {del_asset}", icon="🗑️"); st.rerun()
+                         save_data(app_data); st.toast(f"Deleted {del_asset}", icon="🗑️")
                  else: st.info("No assets.")
 
     if current_holdings:
@@ -350,7 +350,7 @@ with tab2:
                         new_portfolio_data[ticker] = {"quantity": float(row['Quantity']), "average_cost": float(row['Avg. Cost'])}
                 portfolios[selected_portfolio] = new_portfolio_data
                 app_data["portfolios"] = portfolios
-                save_data(app_data); st.rerun()
+                save_data(app_data)
 
         if not holdings_df.empty and total_portfolio_value > 0:
             st.divider()
@@ -597,7 +597,7 @@ with tab5:
                 if new_group_name and new_group_name not in peer_groups:
                     peer_groups[new_group_name] = []
                     app_data["peer_groups"] = peer_groups
-                    save_data(app_data); st.toast(f"Created cohort: {new_group_name}", icon="✅"); st.rerun()
+                    save_data(app_data); st.toast(f"Created cohort: {new_group_name}", icon="✅")
 
     with col_pg_del:
         if group_names:
@@ -606,7 +606,7 @@ with tab5:
                 if st.form_submit_button("Delete Permanently"):
                     del peer_groups[group_to_delete]
                     app_data["peer_groups"] = peer_groups
-                    save_data(app_data); st.toast("Cohort deleted.", icon="🗑️"); st.rerun()
+                    save_data(app_data); st.toast("Cohort deleted.", icon="🗑️")
     st.divider()
 
     if selected_group and selected_group != "None":
@@ -619,7 +619,7 @@ with tab5:
                     if new_peer not in group_tickers:
                         peer_groups[selected_group].append(new_peer)
                         app_data["peer_groups"] = peer_groups
-                        save_data(app_data); st.rerun()
+                        save_data(app_data)
         with col_t_del:
             if group_tickers:
                 with st.form("remove_peer_form"):
@@ -627,7 +627,7 @@ with tab5:
                     if st.form_submit_button("Remove Asset"):
                         peer_groups[selected_group].remove(peer_to_remove)
                         app_data["peer_groups"] = peer_groups
-                        save_data(app_data); st.rerun()
+                        save_data(app_data)
 
         if group_tickers:
             st.subheader(f"Relative Valuation: {selected_group}")
