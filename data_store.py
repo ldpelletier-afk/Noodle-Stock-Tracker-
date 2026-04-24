@@ -117,6 +117,28 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             last_price REAL,
             PRIMARY KEY (ticker, kind, target)
         );
+
+        CREATE TABLE IF NOT EXISTS favorite_stocks (
+            ticker TEXT PRIMARY KEY,
+            notes TEXT NOT NULL DEFAULT '',
+            goal_price REAL,
+            position_note TEXT NOT NULL DEFAULT '',
+            added_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS saved_articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT,
+            source TEXT,
+            note TEXT NOT NULL DEFAULT '',
+            saved_at INTEGER NOT NULL,
+            published_at INTEGER,
+            UNIQUE(ticker, url)
+        );
+        CREATE INDEX IF NOT EXISTS idx_saved_articles_ticker
+            ON saved_articles(ticker, saved_at DESC);
         """
     )
 
@@ -221,10 +243,23 @@ def load_data() -> dict[str, Any]:
         ):
             peer_groups.setdefault(row["group_name"], []).append(row["ticker"])
 
+        favorite_stocks: dict[str, dict[str, Any]] = {}
+        for row in conn.execute(
+            "SELECT ticker, notes, goal_price, position_note, added_at "
+            "FROM favorite_stocks ORDER BY added_at ASC"
+        ):
+            favorite_stocks[row["ticker"]] = {
+                "notes": row["notes"] or "",
+                "goal_price": row["goal_price"],
+                "position_note": row["position_note"] or "",
+                "added_at": row["added_at"],
+            }
+
     return {
         "portfolios": portfolios,
         "watch_list_targets": watch_list,
         "peer_groups": peer_groups,
+        "favorite_stocks": favorite_stocks,
     }
 
 
@@ -232,6 +267,7 @@ def _write_dict(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
     portfolios = data.get("portfolios", {}) or {}
     watch_list = data.get("watch_list_targets", {}) or {}
     peer_groups = data.get("peer_groups", {}) or {}
+    favorite_stocks = data.get("favorite_stocks", None)  # None = don't touch
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -269,6 +305,26 @@ def _write_dict(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
                     "INSERT OR IGNORE INTO peer_group_members(group_name, ticker) VALUES (?, ?)",
                     (group, _sanitize_ticker(t)),
                 )
+
+        # Only rewrite favorites if the caller explicitly passed them; `None`
+        # means preserve existing rows (favorites are usually mutated via
+        # dedicated helpers, not via full-dict save_data).
+        if favorite_stocks is not None:
+            conn.execute("DELETE FROM favorite_stocks")
+            for ticker, fav in (favorite_stocks or {}).items():
+                conn.execute(
+                    """INSERT INTO favorite_stocks
+                         (ticker, notes, goal_price, position_note, added_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        _sanitize_ticker(ticker),
+                        str(fav.get("notes") or ""),
+                        float(fav["goal_price"]) if fav.get("goal_price") is not None else None,
+                        str(fav.get("position_note") or ""),
+                        int(fav.get("added_at") or time.time()),
+                    ),
+                )
+
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -427,3 +483,141 @@ def get_watch_targets() -> dict[str, float]:
                 "SELECT ticker, target_price FROM watch_list WHERE target_price > 0"
             )
         }
+
+
+# ---------- Favorite stocks ----------
+
+def list_favorites() -> dict[str, dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        return {
+            row["ticker"]: {
+                "notes": row["notes"] or "",
+                "goal_price": row["goal_price"],
+                "position_note": row["position_note"] or "",
+                "added_at": row["added_at"],
+            }
+            for row in conn.execute(
+                "SELECT ticker, notes, goal_price, position_note, added_at "
+                "FROM favorite_stocks ORDER BY added_at ASC"
+            )
+        }
+
+
+def add_favorite(ticker: str) -> bool:
+    """Insert a new favorite. Returns True if inserted, False if already existed."""
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    if not ticker:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO favorite_stocks(ticker, added_at) VALUES (?, ?)",
+            (ticker, int(time.time())),
+        )
+        return cur.rowcount > 0
+
+
+def remove_favorite(ticker: str) -> None:
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    with _connect() as conn:
+        conn.execute("DELETE FROM favorite_stocks WHERE ticker = ?", (ticker,))
+        conn.execute("DELETE FROM saved_articles WHERE ticker = ?", (ticker,))
+
+
+def update_favorite(
+    ticker: str,
+    notes: str | None = None,
+    goal_price: float | None = None,
+    position_note: str | None = None,
+    clear_goal: bool = False,
+) -> None:
+    """Patch a favorite. Pass only the fields you want to change.
+    Use `clear_goal=True` to explicitly null-out goal_price (since passing None
+    means 'don't change'). Same pattern for notes/position_note: pass the new
+    string to overwrite, or None to leave alone."""
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    updates = []
+    params: list[Any] = []
+    if notes is not None:
+        updates.append("notes = ?")
+        params.append(str(notes))
+    if goal_price is not None or clear_goal:
+        updates.append("goal_price = ?")
+        params.append(None if clear_goal else float(goal_price))
+    if position_note is not None:
+        updates.append("position_note = ?")
+        params.append(str(position_note))
+    if not updates:
+        return
+    params.append(ticker)
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE favorite_stocks SET {', '.join(updates)} WHERE ticker = ?",
+            params,
+        )
+
+
+# ---------- Saved articles (manual "noteworthy" URL capture) ----------
+
+def save_article(
+    ticker: str,
+    url: str,
+    title: str | None = None,
+    source: str | None = None,
+    note: str = "",
+    published_at: int | None = None,
+) -> int | None:
+    """Insert a saved article. Returns the new row id, or None if it was a
+    duplicate (same ticker + url)."""
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO saved_articles
+                 (ticker, url, title, source, note, saved_at, published_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ticker,
+                url.strip(),
+                (title or "").strip() or None,
+                (source or "").strip() or None,
+                note or "",
+                int(time.time()),
+                int(published_at) if published_at else None,
+            ),
+        )
+        return cur.lastrowid if cur.rowcount > 0 else None
+
+
+def list_saved_articles(ticker: str) -> list[dict[str, Any]]:
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    with _connect() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                """SELECT id, ticker, url, title, source, note, saved_at, published_at
+                   FROM saved_articles
+                   WHERE ticker = ?
+                   ORDER BY COALESCE(published_at, saved_at) DESC""",
+                (ticker,),
+            )
+        ]
+
+
+def delete_saved_article(article_id: int) -> None:
+    init_db()
+    with _connect() as conn:
+        conn.execute("DELETE FROM saved_articles WHERE id = ?", (int(article_id),))
+
+
+def update_saved_article_note(article_id: int, note: str) -> None:
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE saved_articles SET note = ? WHERE id = ?",
+            (note or "", int(article_id)),
+        )
