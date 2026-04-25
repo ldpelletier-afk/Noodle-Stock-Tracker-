@@ -27,7 +27,10 @@ from api import (
 )
 from data_store import (
     add_favorite,
+    add_to_watchlist,
+    create_watchlist,
     delete_saved_article,
+    delete_watchlist,
     fetch_transactions,
     import_transactions,
     list_favorites,
@@ -35,15 +38,35 @@ from data_store import (
     load_data as _load_data_sqlite,
     log_transaction,
     remove_favorite,
+    remove_from_watchlist,
+    rename_watchlist,
     save_article,
     save_data as _save_data_sqlite,
+    set_target_in_watchlist,
     update_favorite,
     update_saved_article_note,
 )
+from rag import CATEGORIES as _CATEGORIES
+from rag import TOPIC_LABELS as _TOPIC_LABELS
+from rag import TOPICS as _TOPICS
 from rag import already_ingested as _already_ingested
+from rag import decompose_query as _decompose_query
+from rag import delete_document as _delete_document
+from rag import format_chunks_for_citation as _format_chunks_for_citation
 from rag import ingest_chunks as _ingest_chunks
+from rag import list_documents as _list_documents
+from rag import retrieve_multi as _retrieve_multi
+from rag import route_query as _route_query
+from rag import set_category as _set_category
+from rag import set_topics as _set_topics
+from rag import verify_citations as _verify_citations
 from rag import vector_db as _vector_db
 from utils import format_large_number, highlight_buy_zone, sanitize_ticker
+
+# Risk analytics + agentic ticker analyst — lazy-friendly; they only hit
+# yfinance / ollama when their tabs are actually used.
+from risk import portfolio_risk_report as _portfolio_risk_report
+from agent import run_analyze_ticker as _run_analyze_ticker
 
 # --- CONFIGURATION & STORAGE ---
 DB_DIR = "./chroma_db"
@@ -70,83 +93,202 @@ portfolios = app_data.get("portfolios", {})
 watch_list_targets = app_data.get("watch_list_targets", {})
 peer_groups = app_data.get("peer_groups", {})
 
-tab1, tab_fav, tab2, tab_hist, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📈 Market Watch", "⭐ Favorites", "💼 Asset Tracker", "📒 History", "⚖️ Valuation",
-    "📰 Intelligence", "🏢 Peer Matrix", "🏦 Macro", "📚 The Library"
+(
+    tab1, tab_fav, tab2, tab_hist, tab_risk, tab3, tab4, tab5, tab6, tab7, tab_analyst
+) = st.tabs([
+    "📈 Market Watch", "⭐ Favorites", "💼 Asset Tracker", "📒 History", "🛡️ Risk",
+    "⚖️ Valuation", "📰 Intelligence", "🏢 Peer Matrix", "🏦 Macro",
+    "📚 The Library", "🧠 Analyst",
 ])
 
 # ===========================
-# TAB 1: MARKET WATCH 
+# TAB 1: MARKET WATCH
 # ===========================
 with tab1:
-    tickers = list(watch_list_targets.keys())
+    watchlists = app_data.get("watchlists", {})
+
+    # Collect every ticker across all lists for a single bulk price fetch.
+    all_wl_tickers = list({t for items in watchlists.values() for t in items})
+
     with st.spinner("Fetching live market data..."):
-        live_prices = fetch_live_prices(tickers)
+        live_prices = fetch_live_prices(all_wl_tickers)
 
-    crashing_assets = []
-    for t in tickers:
-        pct_drop = live_prices.get(t, {}).get('change')
-        if pct_drop is not None and pct_drop <= -5.0:
-            crashing_assets.append(f"**{t}** ({pct_drop}%)")
-    
+    # Global volatility alert (across every list)
+    crashing_assets = [
+        f"**{t}** ({live_prices.get(t, {}).get('change', 0):.2f}%)"
+        for t in all_wl_tickers
+        if live_prices.get(t, {}).get("change") is not None
+        and live_prices.get(t, {}).get("change") <= -5.0
+    ]
     if crashing_assets:
-        st.error(f"🚨 **Volatility Alert:** The following assets are down 5% or more today: {', '.join(crashing_assets)}")
+        st.error(
+            f"🚨 **Volatility Alert:** The following assets are down 5 % or more "
+            f"today: {', '.join(crashing_assets)}"
+        )
 
-    df_data = {
-        "Ticker": tickers,
-        "Live Price (from API)": [live_prices.get(t, {}).get('price') for t in tickers],
-        "Day Change (%)": [live_prices.get(t, {}).get('change') for t in tickers],
-        "Target Price (Self-set)": [watch_list_targets.get(t) for t in tickers]
+    # ---- Per-list expandable sections ----
+    _COL_CFG = {
+        "Live Price (from API)": st.column_config.NumberColumn(format="$%.2f"),
+        "Day Change (%)": st.column_config.NumberColumn(format="%.2f%%"),
+        "Target Price (Self-set)": st.column_config.NumberColumn(
+            format="$%.2f", step=0.01
+        ),
     }
-    df = pd.DataFrame(df_data)
 
-    st.subheader("Watch List & Price Targets")
-    edited_df = st.data_editor(
-        df.style.apply(highlight_buy_zone, axis=1),
-        disabled=["Ticker", "Live Price (from API)", "Day Change (%)"],
-        hide_index=True, use_container_width=True,
-        column_config={
-            "Live Price (from API)": st.column_config.NumberColumn(format="$%.2f"),
-            "Day Change (%)": st.column_config.NumberColumn(format="%.2f%%"),
-            "Target Price (Self-set)": st.column_config.NumberColumn(format="$%.2f", step=1.0)
-        }
-    )
+    if watchlists:
+        for _list_name, _items in watchlists.items():
+            _list_tickers = list(_items.keys())
+            _label = (
+                f"📋 {_list_name}  ·  {len(_list_tickers)} "
+                f"stock{'s' if len(_list_tickers) != 1 else ''}"
+            )
+            with st.expander(_label, expanded=True):
 
-    if not edited_df.equals(df):
-        app_data["watch_list_targets"] = dict(zip(edited_df["Ticker"], edited_df["Target Price (Self-set)"]))
-        save_data(app_data)
-        st.toast("Target prices saved!", icon="✅")
+                # Price table
+                if _list_tickers:
+                    _df = pd.DataFrame({
+                        "Ticker": _list_tickers,
+                        "Live Price (from API)": [
+                            live_prices.get(t, {}).get("price") for t in _list_tickers
+                        ],
+                        "Day Change (%)": [
+                            live_prices.get(t, {}).get("change") for t in _list_tickers
+                        ],
+                        "Target Price (Self-set)": [
+                            _items.get(t, 0.0) for t in _list_tickers
+                        ],
+                    })
+                    _edited = st.data_editor(
+                        _df.style.apply(highlight_buy_zone, axis=1),
+                        disabled=["Ticker", "Live Price (from API)", "Day Change (%)"],
+                        hide_index=True,
+                        use_container_width=True,
+                        key=f"wl_editor_{_list_name}",
+                        column_config=_COL_CFG,
+                    )
+                    # Save any changed target prices immediately
+                    if not _edited.equals(_df):
+                        for _, _row in _edited.iterrows():
+                            _old = float(_items.get(_row["Ticker"], 0.0) or 0.0)
+                            _new = float(_row["Target Price (Self-set)"] or 0.0)
+                            if abs(_new - _old) > 1e-9:
+                                set_target_in_watchlist(
+                                    _list_name, _row["Ticker"], _new
+                                )
+                        st.toast(f"Targets updated in '{_list_name}'", icon="✅")
+                        st.rerun()
+                else:
+                    st.caption("This list is empty — add a ticker below.")
+
+                st.divider()
+
+                # Add / Remove ticker
+                _ca, _cr = st.columns(2)
+                with _ca:
+                    st.markdown("**Add ticker**")
+                    _add_t = sanitize_ticker(
+                        st.text_input(
+                            "Ticker",
+                            key=f"wl_add_{_list_name}",
+                            placeholder="e.g. MSFT",
+                            label_visibility="collapsed",
+                        )
+                    )
+                    if st.button(
+                        "➕ Add", key=f"wl_addbtn_{_list_name}", use_container_width=True
+                    ):
+                        if _add_t:
+                            if add_to_watchlist(_list_name, _add_t):
+                                st.rerun()
+                            else:
+                                st.warning(f"{_add_t} is already in '{_list_name}'.")
+                with _cr:
+                    st.markdown("**Remove ticker**")
+                    if _list_tickers:
+                        _rm_t = st.selectbox(
+                            "Ticker",
+                            _list_tickers,
+                            key=f"wl_rm_{_list_name}",
+                            label_visibility="collapsed",
+                        )
+                        if st.button(
+                            "🗑️ Remove",
+                            key=f"wl_rmbtn_{_list_name}",
+                            use_container_width=True,
+                            type="primary",
+                        ):
+                            remove_from_watchlist(_list_name, _rm_t)
+                            st.rerun()
+                    else:
+                        st.empty()
+
+                # Rename / Delete list
+                st.markdown("---")
+                _cn, _cd = st.columns([4, 1])
+                with _cn:
+                    _new_name = st.text_input(
+                        "Rename list",
+                        value=_list_name,
+                        key=f"wl_rename_{_list_name}",
+                        label_visibility="collapsed",
+                        placeholder="New list name…",
+                    )
+                    if st.button(
+                        "✏️ Rename list", key=f"wl_renamebtn_{_list_name}"
+                    ):
+                        if _new_name and _new_name != _list_name:
+                            if rename_watchlist(_list_name, _new_name):
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    f"A list named '{_new_name}' already exists."
+                                )
+                with _cd:
+                    st.write("")
+                    st.write("")
+                    if st.button(
+                        "🗑️ Delete list",
+                        key=f"wl_delbtn_{_list_name}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        delete_watchlist(_list_name)
+                        st.rerun()
+    else:
+        st.info("No watch lists yet — create one below.")
 
     st.divider()
 
-    col_add, col_del = st.columns(2)
-    with col_add:
-        st.subheader("Add to Watch List")
-        new_ticker = sanitize_ticker(st.text_input("Enter Ticker Symbol (e.g., MSFT)", key="wl_add").upper())
-        if st.button("Add Stock", use_container_width=True):
-            if new_ticker and new_ticker not in watch_list_targets:
-                watch_list_targets[new_ticker] = 0.0 
-                app_data["watch_list_targets"] = watch_list_targets
-                save_data(app_data)
-            elif new_ticker in watch_list_targets: st.warning("Ticker already on watch list.")
-                
-    with col_del:
-        st.subheader("Remove from Watch List")
-        if tickers:
-            ticker_to_remove = st.selectbox("Select Asset to Delete", tickers, key="wl_del")
-            if st.button("Delete Stock", type="primary", use_container_width=True):
-                del watch_list_targets[ticker_to_remove]
-                app_data["watch_list_targets"] = watch_list_targets
-                save_data(app_data); st.toast(f"Removed {ticker_to_remove}", icon="🗑️")
-        else: st.info("Watch list is empty.")
+    # ---- Create new list ----
+    st.subheader("➕ Create new list")
+    _nl_col1, _nl_col2 = st.columns([3, 1])
+    with _nl_col1:
+        _new_list_name = st.text_input(
+            "New list name",
+            key="wl_new_list_name",
+            placeholder="e.g. Tech Stocks",
+            label_visibility="collapsed",
+        )
+    with _nl_col2:
+        if st.button("Create", key="wl_create_list", use_container_width=True):
+            if _new_list_name.strip():
+                if create_watchlist(_new_list_name.strip()):
+                    st.toast(f"Created list '{_new_list_name}'", icon="✅")
+                    st.rerun()
+                else:
+                    st.warning(f"A list named '{_new_list_name}' already exists.")
 
     st.divider()
 
     st.subheader("Deep Dive Analysis")
     col_asset, col_refresh = st.columns([3, 1])
-    with col_asset: selected_ticker = st.selectbox("Select Asset for Analysis", tickers if tickers else [""])
+    with col_asset:
+        selected_ticker = st.selectbox(
+            "Select Asset for Analysis",
+            all_wl_tickers if all_wl_tickers else [""],
+        )
     with col_refresh:
-        st.write(""); st.write("") 
+        st.write(""); st.write("")
         if st.button("🔄 Force Refresh Data", use_container_width=True):
             fetch_stock_details.clear(); fetch_live_prices.clear()
 
@@ -309,44 +451,70 @@ with tab_fav:
         )
 
         # --- Notes / goal / position controls ---
+        # Wrapped in st.form so pressing "Save changes" commits ALL widget
+        # values atomically. Without a form, st.number_input only commits on
+        # blur — so clicking Save right after typing a goal (without Tab/Enter
+        # first) would miss the new value and silently save nothing.
         with st.expander("📝 Notes, goal, and position", expanded=True):
-            col_n, col_g = st.columns([3, 1])
-            with col_n:
-                new_notes = st.text_area(
-                    "Notes",
-                    value=fav.get("notes") or "",
-                    height=140,
-                    key=f"fav_notes_{focus_ticker}",
-                    help="Your thesis, watch criteria, or anything else worth remembering.",
+            with st.form(key=f"fav_meta_form_{focus_ticker}", clear_on_submit=False):
+                col_n, col_g = st.columns([3, 1])
+                with col_n:
+                    new_notes = st.text_area(
+                        "Notes",
+                        value=fav.get("notes") or "",
+                        height=140,
+                        key=f"fav_notes_{focus_ticker}",
+                        help="Your thesis, watch criteria, or anything else worth remembering.",
+                    )
+                with col_g:
+                    new_goal = st.number_input(
+                        "Goal price ($)",
+                        min_value=0.0,
+                        value=float(fav.get("goal_price") or 0.0),
+                        step=0.01,
+                        format="%.2f",
+                        key=f"fav_goal_{focus_ticker}",
+                        help="Accepts dollars and cents (e.g. 247.85). "
+                             "Set to any value > 0 to save a goal. Leave at 0 to skip. "
+                             "Tick 'Clear goal' to explicitly remove an existing goal.",
+                    )
+                    clear_goal = st.checkbox(
+                        "Clear goal",
+                        value=False,
+                        key=f"fav_clear_goal_{focus_ticker}",
+                    )
+                new_position = st.text_input(
+                    "Position note (e.g., '10 shares @ $150, added 2024-11-01')",
+                    value=fav.get("position_note") or "",
+                    key=f"fav_pos_{focus_ticker}",
                 )
-            with col_g:
-                new_goal = st.number_input(
-                    "Goal price ($)",
-                    min_value=0.0,
-                    value=float(fav.get("goal_price") or 0.0),
-                    step=1.0,
-                    key=f"fav_goal_{focus_ticker}",
+                submitted = st.form_submit_button("💾 Save changes")
+
+            if submitted:
+                kwargs = {
+                    "notes": new_notes,
+                    "position_note": new_position,
+                }
+                # Only touch goal_price when the user meaningfully asked to.
+                # - explicit clear checkbox → clear
+                # - new_goal > 0            → set to that value
+                # - otherwise               → leave existing goal alone
+                if clear_goal:
+                    kwargs["clear_goal"] = True
+                elif new_goal > 0:
+                    kwargs["goal_price"] = float(new_goal)
+
+                update_favorite(focus_ticker, **kwargs)
+
+                saved_bits = ["notes", "position"]
+                if clear_goal:
+                    saved_bits.append("goal cleared")
+                elif new_goal > 0:
+                    saved_bits.append(f"goal=${new_goal:.2f}")
+                st.toast(
+                    f"Saved {focus_ticker}: " + ", ".join(saved_bits),
+                    icon="💾",
                 )
-                clear_goal = st.checkbox(
-                    "Clear goal",
-                    value=False,
-                    key=f"fav_clear_goal_{focus_ticker}",
-                )
-            new_position = st.text_input(
-                "Position note (e.g., '10 shares @ $150, added 2024-11-01')",
-                value=fav.get("position_note") or "",
-                key=f"fav_pos_{focus_ticker}",
-            )
-            if st.button("💾 Save changes", key=f"fav_save_{focus_ticker}"):
-                do_clear = clear_goal or new_goal <= 0
-                update_favorite(
-                    focus_ticker,
-                    notes=new_notes,
-                    goal_price=(None if do_clear else float(new_goal)),
-                    position_note=new_position,
-                    clear_goal=do_clear,
-                )
-                st.toast(f"Saved changes for {focus_ticker}", icon="💾")
                 st.rerun()
 
         # --- Financial highlights ---
@@ -966,6 +1134,308 @@ with tab_hist:
             st.plotly_chart(fig_year, use_container_width=True)
 
 # ===========================
+# TAB RISK: PORTFOLIO RISK DASHBOARD
+# ===========================
+with tab_risk:
+    st.header("🛡️ Portfolio Risk Dashboard")
+    st.caption(
+        "VaR, drawdown, correlation, beta, and factor exposure on your "
+        "live holdings. Uses daily adjusted closes from yfinance — "
+        "computed client-side, cached for an hour."
+    )
+
+    _risk_portfolios = list(portfolios.keys())
+    if not _risk_portfolios:
+        st.info("Create a portfolio in the Asset Tracker tab to unlock this module.")
+    else:
+        r_col1, r_col2, r_col3, r_col4 = st.columns([2, 1, 1, 1])
+        with r_col1:
+            risk_portfolio = st.selectbox(
+                "Portfolio",
+                ["All Portfolios"] + _risk_portfolios,
+                key="risk_portfolio",
+            )
+        with r_col2:
+            risk_period = st.selectbox(
+                "Lookback", ["1y", "2y", "5y"], index=1, key="risk_period",
+            )
+        with r_col3:
+            risk_conf = st.selectbox(
+                "VaR Confidence", ["95%", "99%"], index=0, key="risk_conf",
+            )
+        with r_col4:
+            risk_bench = st.selectbox(
+                "Benchmark", ["SPY", "QQQ", "IWM", "ACWI"], index=0, key="risk_bench",
+            )
+
+        # Assemble holdings.
+        if risk_portfolio == "All Portfolios":
+            agg = {}
+            for _p, _h in portfolios.items():
+                for _t, _pos in _h.items():
+                    if _t in agg:
+                        total_qty = agg[_t]["quantity"] + _pos["quantity"]
+                        total_cost = (
+                            agg[_t]["quantity"] * agg[_t]["average_cost"]
+                            + _pos["quantity"] * _pos["average_cost"]
+                        )
+                        agg[_t] = {
+                            "quantity": total_qty,
+                            "average_cost": total_cost / total_qty if total_qty else 0,
+                        }
+                    else:
+                        agg[_t] = dict(_pos)
+            risk_holdings = agg
+        else:
+            risk_holdings = portfolios[risk_portfolio]
+
+        if not risk_holdings or all(t.upper() == "CASH" for t in risk_holdings):
+            st.info("Portfolio has no risk-bearing positions.")
+        elif st.button("Run Risk Analysis", type="primary", use_container_width=True):
+            with st.spinner("Fetching price history & crunching risk metrics..."):
+                _lp_tickers = [t for t in risk_holdings if t.upper() != "CASH"]
+                _lp = fetch_live_prices(_lp_tickers)
+                _conf = 0.95 if risk_conf == "95%" else 0.99
+                report = _portfolio_risk_report(
+                    risk_holdings,
+                    _lp,
+                    period=risk_period,
+                    var_confidence=_conf,
+                    benchmark=risk_bench,
+                )
+
+            if report.get("error"):
+                st.error(report["error"])
+            else:
+                # ----- Headline metrics -----
+                st.subheader("Headline Metrics")
+                h1, h2, h3, h4 = st.columns(4)
+                h1.metric(
+                    "Ann. Return", f"{report['ann_return']*100:,.2f}%"
+                    if pd.notna(report['ann_return']) else "—",
+                )
+                h2.metric(
+                    "Ann. Volatility", f"{report['ann_volatility']*100:,.2f}%"
+                    if pd.notna(report['ann_volatility']) else "—",
+                )
+                h3.metric(
+                    "Sharpe (rf=4%)", f"{report['sharpe']:.2f}"
+                    if pd.notna(report['sharpe']) else "—",
+                )
+                h4.metric(
+                    "Sortino", f"{report['sortino']:.2f}"
+                    if pd.notna(report['sortino']) else "—",
+                )
+
+                v1, v2, v3, v4 = st.columns(4)
+                v1.metric(
+                    f"1-Day VaR ({risk_conf}, hist.)",
+                    f"{report['hist_var_1d']*100:,.2f}%"
+                    if pd.notna(report['hist_var_1d']) else "—",
+                    help="Largest expected daily loss at the stated confidence "
+                         "level, based on observed history.",
+                )
+                v2.metric(
+                    f"1-Day CVaR ({risk_conf})",
+                    f"{report['hist_cvar_1d']*100:,.2f}%"
+                    if pd.notna(report['hist_cvar_1d']) else "—",
+                    help="Expected loss conditional on exceeding the VaR "
+                         "threshold — the 'how bad is bad' number.",
+                )
+                v3.metric(
+                    "Max Drawdown",
+                    f"{report['max_drawdown']*100:,.2f}%"
+                    if pd.notna(report['max_drawdown']) else "—",
+                    help=f"Duration: {report.get('dd_days', 0)} days peak-to-trough.",
+                )
+                v4.metric(
+                    f"Beta vs {risk_bench}",
+                    f"{report['beta']:.2f}"
+                    if pd.notna(report['beta']) else "—",
+                    help=f"R²={report['r_squared']:.2f}" if pd.notna(report['r_squared']) else "",
+                )
+
+                # ----- Parametric cross-check callout -----
+                _hv = report["hist_var_1d"]
+                _pv = report["param_var_1d"]
+                if pd.notna(_hv) and pd.notna(_pv):
+                    delta = (_pv - _hv) / _hv if _hv > 0 else 0
+                    if abs(delta) > 0.30:
+                        st.warning(
+                            f"Parametric VaR ({_pv*100:.2f}%) diverges from "
+                            f"historical ({_hv*100:.2f}%) by {delta*100:+.0f}% — "
+                            "returns likely non-Gaussian (fat tails or skew)."
+                        )
+
+                st.divider()
+
+                # ----- Equity curve + drawdown -----
+                st.subheader("Portfolio Equity Curve & Drawdown")
+                port_r = report["portfolio_returns"]
+                equity = (1 + port_r).cumprod() if not port_r.empty else port_r
+                # Use exp(cumsum) since we compute log returns — more accurate.
+                import numpy as _np
+                equity = _np.exp(port_r.cumsum())
+                roll_max = equity.cummax()
+                dd_series = (equity / roll_max - 1.0) * 100
+
+                fig_eq = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                    row_heights=[0.65, 0.35],
+                    subplot_titles=("Cumulative Return (log-compounded)", "Drawdown (%)"),
+                )
+                fig_eq.add_trace(
+                    go.Scatter(
+                        x=equity.index, y=(equity - 1) * 100,
+                        mode="lines", name="Portfolio",
+                        line=dict(color="#2980b9", width=2),
+                    ),
+                    row=1, col=1,
+                )
+                fig_eq.add_trace(
+                    go.Scatter(
+                        x=dd_series.index, y=dd_series,
+                        mode="lines", name="Drawdown",
+                        line=dict(color="#dc3545", width=1.5),
+                        fill="tozeroy", fillcolor="rgba(220,53,69,0.25)",
+                    ),
+                    row=2, col=1,
+                )
+                if report.get("dd_peak") and report.get("dd_trough"):
+                    fig_eq.add_vline(
+                        x=report["dd_trough"], line_dash="dash",
+                        line_color="rgba(220,53,69,0.5)", row=2, col=1,
+                    )
+                fig_eq.update_layout(
+                    height=520, margin=dict(l=0, r=0, t=40, b=0),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    showlegend=False, hovermode="x unified",
+                )
+                st.plotly_chart(fig_eq, use_container_width=True)
+
+                st.divider()
+
+                # ----- Per-position risk contribution -----
+                st.subheader("Per-Position Risk Contribution")
+                st.caption(
+                    "Marginal Contribution to Risk = weight × cov(asset, port) / var(port). "
+                    "A position with weight 10% but risk-contribution 25% is a concentrated "
+                    "volatility source."
+                )
+                _pp = report["per_position"].copy()
+                st.dataframe(
+                    _pp.style.format({
+                        "Weight": "{:.2%}",
+                        "Vol (ann.)": "{:.2%}",
+                        "Beta": "{:.2f}",
+                        "Contribution to Risk": "{:.2%}",
+                    }, na_rep="—"),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # Concentration line
+                _c = report["concentration"]
+                if pd.notna(_c.get("hhi")):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Positions", f"{_c['n_positions']}")
+                    c2.metric(
+                        "Effective N (1/HHI)", f"{_c['effective_n']:.1f}",
+                        help="How many equally-weighted names this portfolio "
+                             "diversifies LIKE. Much smaller than position count = "
+                             "concentrated.",
+                    )
+                    c3.metric(
+                        "Largest Weight", f"{_c['top']*100:.1f}%",
+                        help="Single-name concentration — a red flag above ~20-25%.",
+                    )
+
+                st.divider()
+
+                # ----- Correlation heatmap -----
+                corr = report.get("correlation")
+                if corr is not None and not corr.empty and corr.shape[0] >= 2:
+                    st.subheader("Holdings Correlation Matrix")
+                    st.caption(
+                        "Daily-return correlations. Highly correlated clusters "
+                        "(>0.7) hint that two positions are really the same bet."
+                    )
+                    fig_corr = go.Figure(data=go.Heatmap(
+                        z=corr.values,
+                        x=list(corr.columns), y=list(corr.index),
+                        colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
+                        text=corr.round(2).values,
+                        texttemplate="%{text}", textfont=dict(size=10),
+                    ))
+                    fig_corr.update_layout(
+                        height=max(350, 30 * len(corr) + 150),
+                        margin=dict(l=0, r=0, t=10, b=0),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+
+                st.divider()
+
+                # ----- Rolling beta -----
+                roll_b = report.get("rolling_beta")
+                if roll_b is not None and not roll_b.empty:
+                    st.subheader(f"Rolling 63-Day Beta vs {risk_bench}")
+                    fig_rb = go.Figure()
+                    fig_rb.add_trace(go.Scatter(
+                        x=roll_b.index, y=roll_b.values,
+                        mode="lines", line=dict(color="#8e44ad", width=2),
+                        name="Rolling Beta",
+                    ))
+                    fig_rb.add_hline(y=1.0, line_dash="dash",
+                                     line_color="rgba(128,128,128,0.5)")
+                    fig_rb.update_layout(
+                        height=320, margin=dict(l=0, r=0, t=10, b=0),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_rb, use_container_width=True)
+
+                # ----- Factor exposure -----
+                fx = report.get("factor_exposure") or {}
+                if fx.get("loadings"):
+                    st.subheader("Factor Exposure (ETF-proxy decomposition)")
+                    st.caption(
+                        "Regression of portfolio returns on: "
+                        "MKT (SPY), SMB (IWM−SPY), HML (VTV−VUG), "
+                        "MOM (MTUM−SPY), RATES (TLT). "
+                        "Loadings show how much of daily P&L swings with each factor."
+                    )
+                    load_df = pd.DataFrame({
+                        "Factor": list(fx["loadings"].keys()),
+                        "Loading": list(fx["loadings"].values()),
+                    })
+                    fig_fx = px.bar(
+                        load_df, x="Factor", y="Loading", color="Loading",
+                        color_continuous_scale=["#dc3545", "#cccccc", "#28a745"],
+                        color_continuous_midpoint=0,
+                    )
+                    fig_fx.update_layout(
+                        height=320, margin=dict(l=0, r=0, t=10, b=0),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    )
+                    st.plotly_chart(fig_fx, use_container_width=True)
+
+                    fxc1, fxc2, fxc3 = st.columns(3)
+                    fxc1.metric(
+                        "Annualized Alpha", f"{fx['alpha_annual']*100:.2f}%",
+                        help="Return not explained by factor exposures. "
+                             "Persistent + alpha = skill or missing factor.",
+                    )
+                    fxc2.metric("R² (factor fit)", f"{fx['r2']:.2f}")
+                    fxc3.metric("Obs", f"{fx['n_obs']}")
+
+                st.caption(
+                    f"Computed on {report['n_obs']} daily observations over "
+                    f"{report['period']}. Risk-free rate assumed 4% for "
+                    f"Sharpe/Sortino. Benchmark: {risk_bench}."
+                )
+
+# ===========================
 # TAB 3: THE VALUATION MACHINE
 # ===========================
 with tab3:
@@ -1220,6 +1690,23 @@ with tab7:
     with col_pdf:
         with st.expander("📚 Upload Local PDF", expanded=False):
             uploaded_file = st.file_uploader("Upload Financial Document", type="pdf")
+            # Category picker — only the three "real" ingestable categories here.
+            _upload_cat_options = ["textbook", "market_report", "sec_filing"]
+            upload_category = st.selectbox(
+                "Categorize this PDF",
+                options=_upload_cat_options,
+                format_func=lambda k: _CATEGORIES[k],
+                key="upload_pdf_category",
+                help="The Oracle can filter retrieval by category when you ask a question.",
+            )
+            upload_topics = st.multiselect(
+                "Topics (multi-select)",
+                options=_TOPICS,
+                default=[],
+                format_func=lambda k: _TOPIC_LABELS[k],
+                key="upload_pdf_topics",
+                help="A document can carry many topics — e.g. Damodaran = valuation + corporate_finance.",
+            )
             if uploaded_file is not None:
                 if st.button("Process PDF", type="primary", use_container_width=True):
                     safe_name = os.path.basename(uploaded_file.name)
@@ -1239,8 +1726,18 @@ with tab7:
 
                         with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
                             try:
-                                n = _ingest_chunks(document_chunks, doc_id, f"PDF: {safe_name}")
-                                st.success(f"✅ Injected '{safe_name}' ({n} chunks) into the database!")
+                                n = _ingest_chunks(
+                                    document_chunks,
+                                    doc_id,
+                                    f"PDF: {safe_name}",
+                                    category=upload_category,
+                                    topics=upload_topics,
+                                )
+                                _t_str = ", ".join(upload_topics) if upload_topics else "no topics"
+                                st.success(
+                                    f"✅ Injected '{safe_name}' ({n} chunks) as "
+                                    f"{_CATEGORIES[upload_category]} — {_t_str}."
+                                )
                             except Exception as e:
                                 st.error(f"Failed to embed document. Error: {e}")
 
@@ -1278,10 +1775,108 @@ with tab7:
 
                         with st.spinner(f"Translating {len(document_chunks)} chunks to vector coordinates..."):
                             try:
-                                n = _ingest_chunks(document_chunks, doc_id, f"SEC EDGAR {target_form}: {sec_ticker}")
+                                n = _ingest_chunks(
+                                    document_chunks,
+                                    doc_id,
+                                    f"SEC EDGAR {target_form}: {sec_ticker}",
+                                    category="sec_filing",
+                                )
                                 st.success(f"✅ Successfully injected {sec_ticker}'s {target_form} ({n} chunks)!")
                             except Exception as e:
                                 st.error(f"Failed to embed {target_form}. Error: {e}")
+
+    st.divider()
+
+    # --- LIBRARY MANAGER (re-categorize / delete) ---
+    _library_docs = _list_documents()
+    _uncat_count = sum(1 for d in _library_docs if d["category"] == "uncategorized")
+    _manager_header = "🗂️ Categorize / Manage Existing PDFs"
+    if _uncat_count:
+        _manager_header += f"  —  ⚠️ {_uncat_count} uncategorized"
+    elif _library_docs:
+        _manager_header += f"  —  {len(_library_docs)} in library"
+
+    with st.expander(_manager_header, expanded=bool(_uncat_count)):
+        st.caption(
+            "Assign or change the category for any PDF you've already ingested. "
+            "Metadata-only update — no re-embedding."
+        )
+        if not _library_docs:
+            st.info("No documents ingested yet. Upload a PDF or rip an SEC filing above.")
+        else:
+            # Bulk action — batch-tag every uncategorized doc in one click.
+            if _uncat_count:
+                _cat_keys_bulk = [k for k in _CATEGORIES.keys() if k != "uncategorized"]
+                bcol1, bcol2 = st.columns([3, 2])
+                with bcol1:
+                    bulk_cat = st.selectbox(
+                        f"Bulk-tag all {_uncat_count} uncategorized document(s) as:",
+                        options=_cat_keys_bulk,
+                        format_func=lambda k: _CATEGORIES[k],
+                        key="bulk_cat_choice",
+                    )
+                with bcol2:
+                    st.write("")  # vertical spacer to align with selectbox
+                    if st.button(
+                        f"Apply to {_uncat_count} document(s)",
+                        key="bulk_cat_apply",
+                        use_container_width=True,
+                    ):
+                        for _d in _library_docs:
+                            if _d["category"] == "uncategorized":
+                                _set_category(_d["doc_id"], bulk_cat)
+                        st.success(f"Tagged {_uncat_count} document(s) as {_CATEGORIES[bulk_cat]}.")
+                        st.rerun()
+                st.divider()
+
+            _cat_keys = list(_CATEGORIES.keys())
+            for d in _library_docs:
+                c1, c2, c3 = st.columns([5, 3, 1])
+                with c1:
+                    _badge = "⚠️ " if d["category"] == "uncategorized" else ""
+                    st.markdown(f"{_badge}**{d['source']}**")
+                    _cur_topics = d.get("topics", [])
+                    _topics_str = (
+                        ", ".join(_cur_topics) if _cur_topics else "no topics"
+                    )
+                    st.caption(
+                        f"`{d['doc_id']}` · {d['chunks']} chunks · "
+                        f"temporal: {d.get('temporal_validity', 'unknown')} · "
+                        f"topics: {_topics_str}"
+                    )
+                with c2:
+                    current = d["category"] if d["category"] in _cat_keys else "uncategorized"
+                    new_cat = st.selectbox(
+                        "Category",
+                        options=_cat_keys,
+                        index=_cat_keys.index(current),
+                        format_func=lambda k: _CATEGORIES[k],
+                        key=f"cat_{d['doc_id']}",
+                        label_visibility="collapsed",
+                    )
+                    new_topics = st.multiselect(
+                        "Topics",
+                        options=_TOPICS,
+                        default=[t for t in _cur_topics if t in _TOPICS],
+                        format_func=lambda k: _TOPIC_LABELS[k],
+                        key=f"top_{d['doc_id']}",
+                        label_visibility="collapsed",
+                        placeholder="Topics (optional, multi-select)",
+                    )
+                    _cat_changed = new_cat != current
+                    _tops_changed = set(new_topics) != set(_cur_topics)
+                    if _cat_changed or _tops_changed:
+                        if st.button("Save", key=f"save_{d['doc_id']}"):
+                            if _cat_changed:
+                                _set_category(d["doc_id"], new_cat)
+                            if _tops_changed:
+                                _set_topics(d["doc_id"], new_topics)
+                            st.success("Saved.")
+                            st.rerun()
+                with c3:
+                    if st.button("🗑️", key=f"del_{d['doc_id']}", help="Remove from library"):
+                        _delete_document(d["doc_id"])
+                        st.rerun()
 
     st.divider()
 
@@ -1303,6 +1898,74 @@ with tab7:
     with col_q2:
         peer_group_options = ["None"] + list(peer_groups.keys())
         context_group = st.selectbox("Inject Peer Group Matrix", peer_group_options)
+
+    # Restrict retrieval to specific document categories (multi-select).
+    _filter_cat_keys = list(_CATEGORIES.keys())
+
+    # Question router — auto-suggest filters from the question text.
+    _router_col_a, _router_col_b = st.columns([1, 3])
+    with _router_col_a:
+        if st.button("🤖 Auto-route from question", use_container_width=True,
+                     help="Ask Ollama to suggest which categories/topics to retrieve from."):
+            if not user_query.strip():
+                st.warning("Enter a question first.")
+            else:
+                with st.spinner("Routing question..."):
+                    suggestion = _route_query(user_query)
+                st.session_state["oracle_router_suggestion"] = suggestion
+    with _router_col_b:
+        _sug = st.session_state.get("oracle_router_suggestion")
+        if _sug:
+            _sc = ", ".join(_sug.get("categories") or []) or "(all)"
+            _st_ = ", ".join(_sug.get("topics") or []) or "(none)"
+            st.caption(
+                f"Router suggests — categories: **{_sc}** · topics: **{_st_}** · "
+                f"domain: `{_sug.get('domain','general')}`"
+            )
+            if _sug.get("rationale"):
+                st.caption(f"_{_sug['rationale']}_")
+
+    _default_cats = (
+        (st.session_state.get("oracle_router_suggestion") or {}).get("categories")
+        or _filter_cat_keys
+    )
+    _default_tops = (
+        (st.session_state.get("oracle_router_suggestion") or {}).get("topics") or []
+    )
+
+    selected_categories = st.multiselect(
+        "Retrieve only from categories",
+        options=_filter_cat_keys,
+        default=_default_cats,
+        format_func=lambda k: _CATEGORIES[k],
+        key="oracle_cat_filter",
+        help="Narrow the Oracle to textbooks, market reports, or SEC filings only.",
+    )
+    selected_topics = st.multiselect(
+        "Retrieve only from topics (OR — any selected topic matches)",
+        options=_TOPICS,
+        default=_default_tops,
+        format_func=lambda k: _TOPIC_LABELS[k],
+        key="oracle_topic_filter",
+        help="Empty = no topic restriction. Topics are ORed together.",
+    )
+
+    _opt_col1, _opt_col2, _opt_col3 = st.columns(3)
+    with _opt_col1:
+        use_mmr = st.checkbox(
+            "MMR diversification", value=True,
+            help="Max Marginal Relevance — reduces near-duplicate chunks in retrieval.",
+        )
+    with _opt_col2:
+        use_multiquery = st.checkbox(
+            "Multi-query decomposition", value=True,
+            help="Break compound questions into sub-queries, retrieve per sub-query, union.",
+        )
+    with _opt_col3:
+        use_citations = st.checkbox(
+            "Citation grounding", value=True,
+            help="Force the Oracle to cite [chunk_N] and verify each cited chunk exists.",
+        )
 
     # 3. The Manual Trigger Button
     trigger_oracle = st.button("🔮 Consult The Oracle", type="primary", use_container_width=True)
@@ -1398,43 +2061,78 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
                         except Exception:
                             peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}): Temporarily Unavailable.\n"
                 
-                    db = _vector_db()
+                    # --- Retrieval pipeline: (optional multi-query) + filtered MMR ---
+                    # Resolve effective category filter — if the user kept the full set
+                    # selected, don't filter by category at all.
+                    _effective_cats = (
+                        selected_categories
+                        if (selected_categories and
+                            len(selected_categories) < len(_filter_cat_keys))
+                        else None
+                    )
+                    _effective_topics = selected_topics or None
 
-                    retrieved_docs = []
-                    if context_ticker:
-                        try:
-                            retrieved_docs = db.similarity_search(
-                                user_query, k=6, filter={"ticker": context_ticker}
-                            )
-                        except Exception:
-                            retrieved_docs = []
-                    if not retrieved_docs:
-                        retrieved_docs = db.similarity_search(user_query, k=6)
+                    if use_multiquery:
+                        with st.spinner("Decomposing question into sub-queries..."):
+                            sub_queries = _decompose_query(user_query, max_sub=3)
+                        if len(sub_queries) > 1:
+                            st.caption("🧩 Sub-queries used: " +
+                                       " · ".join(f"`{q}`" for q in sub_queries[1:]))
+                        retrieved_docs = _retrieve_multi(
+                            sub_queries,
+                            k_per_query=4,
+                            k_total=8,
+                            categories=_effective_cats,
+                            topics_any=_effective_topics,
+                            ticker=context_ticker or None,
+                            use_mmr=use_mmr,
+                        )
+                    else:
+                        from rag import retrieve as _retrieve
+                        retrieved_docs = _retrieve(
+                            user_query,
+                            k=6,
+                            categories=_effective_cats,
+                            topics_any=_effective_topics,
+                            ticker=context_ticker or None,
+                            use_mmr=use_mmr,
+                        )
 
                     if not retrieved_docs:
                         st.info("No relevant information found in your documents.")
                     else:
-                        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
-                        
+                        if use_citations:
+                            context = _format_chunks_for_citation(retrieved_docs)
+                            citation_rule = (
+                                "\n4. Citation Discipline: After every non-trivial factual claim, "
+                                "add a citation of the form [chunk_N] referring to the numbered "
+                                "DOCUMENT CONTEXT blocks below. Do not cite chunks that do not "
+                                "exist. If a claim is not supported by any chunk, say so "
+                                "explicitly — do not fabricate."
+                            )
+                        else:
+                            context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+                            citation_rule = ""
+
                         rag_prompt = f"""You are analyzing a user query based strictly on the provided DOCUMENT CONTEXT. You MUST factor in the LIVE MACRO & CREDIT ENVIRONMENT, MARKET VALUATION, WALL STREET CONSENSUS, PEER GROUP MATRIX, and LIVE NEWS provided below to form a sophisticated, forward-looking thesis designed to maximize profit and identify market mispricings.
-                        
+
                         {macro_injection}
                         {market_injection}
                         {forward_injection}
                         {peer_injection}
                         {news_injection}
-                        
+
                         DOCUMENT CONTEXT:
                         {context}
 
                         QUESTION:
                         {user_query}
                         """
-                        
-                        oracle_persona = """You are 'The True Oracle', an elite financial AI running on a Mac M2. You must strictly obey the following rules:
+
+                        oracle_persona = f"""You are 'The True Oracle', an elite financial AI running on a Mac M2. You must strictly obey the following rules:
 1. The Logic-First Filter: Before answering, perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions. Explicitly list hidden premises (enthymemes).
 2. Probabilistic Calibration: For empirical claims, reject binary True/False. Treat new info as Evidence updating a Prior Belief (Bayesian update). Provide estimated confidence intervals (e.g., Confidence: High, p > 0.8).
-3. Output Structuring: Define ambiguous terms immediately; use numbered steps for reasoning chains; halt and flag logical contradictions."""
+3. Output Structuring: Define ambiguous terms immediately; use numbered steps for reasoning chains; halt and flag logical contradictions.{citation_rule}"""
 
                         st.success("### Oracle's Synthesis")
 
@@ -1452,6 +2150,28 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
                         full_answer = st.write_stream(_stream_oracle())
                         st.session_state['oracle_answer'] = full_answer
                         st.session_state['oracle_sources'] = retrieved_docs
+                        st.session_state['oracle_used_citations'] = bool(use_citations)
+
+                        # Citation verification — surface missing/invalid citations.
+                        if use_citations:
+                            v = _verify_citations(full_answer, retrieved_docs)
+                            st.session_state['oracle_citation_report'] = v
+                            if v["unknown"]:
+                                st.warning(
+                                    "⚠️ Answer cites chunks that don't exist: "
+                                    + ", ".join(f"[chunk_{i}]" for i in v["unknown"])
+                                )
+                            if not v["cited"]:
+                                st.warning(
+                                    "⚠️ No valid [chunk_N] citations detected in the answer. "
+                                    "Claims may be ungrounded."
+                                )
+                            else:
+                                st.success(
+                                    f"✅ {len(v['cited'])} of {len(retrieved_docs)} retrieved "
+                                    f"chunks were cited: " +
+                                    ", ".join(f"[chunk_{i}]" for i in v["cited"])
+                                )
 
                 except Exception as e:
                     st.error(f"Error querying the database: {e}")
@@ -1464,9 +2184,200 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
 
     if st.session_state['oracle_answer']:
         with st.expander("🔍 View Source Documents Used"):
+            _citation_report = st.session_state.get('oracle_citation_report') or {}
+            _cited_set = set(_citation_report.get('cited') or [])
             for i, doc in enumerate(st.session_state['oracle_sources']):
+                chunk_num = i + 1
                 source_name = doc.metadata.get('source', 'Unknown Document')
                 clean_source = os.path.basename(source_name)
-                st.markdown(f"**Source {i+1}:** `{clean_source}`")
+                cat_key = doc.metadata.get('category', 'uncategorized')
+                cat_label = _CATEGORIES.get(cat_key, cat_key)
+                temporal = doc.metadata.get('temporal_validity', 'unknown')
+                doc_topics = [t for t in _TOPICS
+                              if doc.metadata.get(f"topic_{t}") is True]
+                topics_str = ", ".join(doc_topics) if doc_topics else "—"
+                cite_badge = (
+                    " ✅ cited" if chunk_num in _cited_set
+                    else (" ⚪ not cited" if st.session_state.get('oracle_used_citations')
+                          else "")
+                )
+                st.markdown(
+                    f"**[chunk_{chunk_num}]** `{clean_source}` — *{cat_label}* "
+                    f"(`{temporal}`) · topics: {topics_str}{cite_badge}"
+                )
                 st.caption(doc.page_content)
                 st.write("---")
+
+# ===========================
+# TAB ANALYST: AGENTIC "ANALYZE TICKER" WORKFLOW
+# ===========================
+with tab_analyst:
+    st.header("🧠 Analyze Ticker — Agentic Workflow")
+    st.markdown(
+        "A full buy-side memo assembled from **market data + DCF + peers + "
+        "macro + SEC 10-K + recent news + your reference library**, then "
+        "synthesized by Llama 3.2 into a structured Bull / Bear / Confidence "
+        "briefing. Runs data gathering concurrently — expect ~30-60 seconds "
+        "on a cold cache, faster on repeat."
+    )
+
+    a_col1, a_col2 = st.columns([2, 3])
+    with a_col1:
+        analyst_ticker = sanitize_ticker(
+            st.text_input(
+                "Target Ticker",
+                value="AAPL",
+                key="analyst_ticker",
+            ).upper()
+        )
+    with a_col2:
+        peer_options = ["(none)"] + list(peer_groups.keys())
+        analyst_peer_group = st.selectbox(
+            "Inject peer cohort (optional)",
+            peer_options,
+            key="analyst_peer_group",
+        )
+
+    ac1, ac2 = st.columns([1, 1])
+    with ac1:
+        include_sec_10k = st.checkbox(
+            "Include SEC 10-K excerpt",
+            value=True,
+            help="Pulls the most recent annual filing. Adds ~10-15s on cold "
+                 "cache. Turn off if you only want fast market-layer analysis.",
+        )
+    with ac2:
+        stream_memo = st.checkbox(
+            "Stream memo as it generates",
+            value=True,
+            help="Off = faster for short memos; On = see the Oracle think.",
+        )
+
+    run_analyst = st.button(
+        "🚀 Run Full Analysis",
+        type="primary",
+        use_container_width=True,
+        key="analyst_run",
+    )
+
+    # Session-state carryover so the result survives re-renders.
+    if "analyst_result" not in st.session_state:
+        st.session_state["analyst_result"] = None
+
+    if run_analyst:
+        if not analyst_ticker:
+            st.warning("Enter a ticker to analyze.")
+        else:
+            # ---- Live progress panel wired to agent.py via callback ----
+            _step_labels = {
+                "market":    "Live market snapshot (yfinance)",
+                "consensus": "Wall Street consensus",
+                "dcf":       "Quick DCF (default assumptions)",
+                "news":      "Recent news (Yahoo RSS)",
+                "peers":     "Peer metrics matrix",
+                "macro":     "Macro & credit (FRED)",
+                "sec":       "SEC 10-K excerpt",
+                "rag":       "Reference library retrieval",
+                "synthesis": "LLM synthesis",
+            }
+            _status_icons = {
+                "start": "⏳", "done": "✅", "skip": "⚪", "error": "❌",
+            }
+            _progress_state: dict[str, tuple[str, str]] = {}
+            progress_box = st.empty()
+
+            def _render_progress():
+                lines = []
+                for key, label in _step_labels.items():
+                    status, detail = _progress_state.get(key, ("pending", ""))
+                    icon = _status_icons.get(status, "⏱️")
+                    suffix = f"  _{detail}_" if detail else ""
+                    lines.append(f"{icon}  **{label}**{suffix}")
+                progress_box.markdown("\n\n".join(lines))
+
+            def _cb(step: str, status: str, detail: str = ""):
+                _progress_state[step] = (status, detail)
+                _render_progress()
+
+            _render_progress()
+
+            _peer_tickers = (
+                peer_groups.get(analyst_peer_group)
+                if analyst_peer_group and analyst_peer_group != "(none)"
+                else None
+            )
+
+            try:
+                envelope = _run_analyze_ticker(
+                    analyst_ticker,
+                    peer_group_tickers=_peer_tickers,
+                    include_sec=include_sec_10k,
+                    progress_callback=_cb,
+                    stream=stream_memo,
+                )
+            except Exception as e:
+                st.error(f"Analysis pipeline failed: {e}")
+                envelope = None
+
+            if envelope and not envelope.get("error"):
+                st.divider()
+                st.subheader(f"📋 Investment Memo — {analyst_ticker}")
+
+                if stream_memo and envelope.get("memo_stream"):
+                    memo_text = st.write_stream(envelope["memo_stream"])
+                    envelope = envelope["finalize"](memo_text) if envelope.get("finalize") else envelope
+                else:
+                    st.markdown(envelope.get("memo") or "_(no memo)_")
+
+                # Confidence banner
+                conf = (envelope.get("confidence") or {})
+                stance = conf.get("stance")
+                conf_level = conf.get("confidence")
+                if stance and conf_level:
+                    banner_fn = {
+                        "Bullish": st.success,
+                        "Bearish": st.error,
+                        "Neutral": st.info,
+                    }.get(stance, st.info)
+                    banner_fn(f"**Final Stance:** {stance}  ·  **Confidence:** {conf_level}")
+
+                st.session_state["analyst_result"] = envelope
+            elif envelope and envelope.get("error"):
+                st.error(envelope["error"])
+
+    # ---- Persistent result view (survives reruns) ----
+    _cached = st.session_state.get("analyst_result")
+    if _cached and not run_analyst:
+        st.divider()
+        st.subheader(f"📋 Last Memo — {_cached.get('ticker', '?')}")
+        st.markdown(_cached.get("memo") or "_(no memo)_")
+        conf = (_cached.get("confidence") or {})
+        if conf.get("stance") and conf.get("confidence"):
+            banner_fn = {
+                "Bullish": st.success,
+                "Bearish": st.error,
+                "Neutral": st.info,
+            }.get(conf["stance"], st.info)
+            banner_fn(
+                f"**Final Stance:** {conf['stance']}  ·  "
+                f"**Confidence:** {conf['confidence']}"
+            )
+
+    if _cached:
+        with st.expander("🔎 Raw Context Blocks (what the LLM saw)"):
+            blocks = _cached.get("context_blocks") or {}
+            for _name, _text in blocks.items():
+                if not _text:
+                    continue
+                st.markdown(f"**{_name.upper()}**")
+                st.code(_text, language="text")
+
+        _rag_docs = _cached.get("rag_docs") or []
+        if _rag_docs:
+            with st.expander(f"📚 Reference Library Chunks Used ({len(_rag_docs)})"):
+                for i, d in enumerate(_rag_docs, 1):
+                    src = os.path.basename(d.metadata.get("source", "?"))
+                    cat = d.metadata.get("category", "?")
+                    st.markdown(f"**[chunk_{i}]** `{src}` — *{cat}*")
+                    st.caption(d.page_content)
+                    st.write("---")

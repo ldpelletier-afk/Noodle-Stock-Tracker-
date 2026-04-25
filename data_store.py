@@ -62,6 +62,26 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "transactions", "cost_basis"):
         conn.execute("ALTER TABLE transactions ADD COLUMN cost_basis REAL")
 
+    # One-shot: migrate the old flat watch_list into the new named-list structure.
+    # Only runs when watch_lists is empty (first upgrade from a pre-multi-list DB).
+    if not conn.execute("SELECT 1 FROM watch_lists LIMIT 1").fetchone():
+        old_items = conn.execute(
+            "SELECT ticker, target_price FROM watch_list"
+        ).fetchall()
+        if old_items:
+            now = int(time.time())
+            conn.execute(
+                "INSERT OR IGNORE INTO watch_lists(name, sort_order, created_at)"
+                " VALUES (?,0,?)",
+                ("General", now),
+            )
+            for row in old_items:
+                conn.execute(
+                    "INSERT OR IGNORE INTO watch_list_items"
+                    "(list_name, ticker, target_price) VALUES (?,?,?)",
+                    ("General", row["ticker"], row["target_price"]),
+                )
+
 
 def _create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
@@ -83,6 +103,25 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             ticker TEXT PRIMARY KEY,
             target_price REAL NOT NULL DEFAULT 0
         );
+
+        -- Named, user-created watchlists (replaces the single flat watch_list)
+        CREATE TABLE IF NOT EXISTS watch_lists (
+            name TEXT PRIMARY KEY,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS watch_list_items (
+            list_name TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            target_price REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (list_name, ticker),
+            FOREIGN KEY (list_name)
+                REFERENCES watch_lists(name) ON DELETE CASCADE ON UPDATE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wli_list
+            ON watch_list_items(list_name);
 
         CREATE TABLE IF NOT EXISTS peer_groups (
             name TEXT PRIMARY KEY
@@ -144,20 +183,33 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
 
 def _maybe_seed_defaults(conn: sqlite3.Connection) -> None:
-    has_any = conn.execute(
-        "SELECT 1 FROM portfolios LIMIT 1"
-    ).fetchone() or conn.execute(
-        "SELECT 1 FROM watch_list LIMIT 1"
-    ).fetchone()
+    has_any = (
+        conn.execute("SELECT 1 FROM portfolios LIMIT 1").fetchone()
+        or conn.execute("SELECT 1 FROM watch_lists LIMIT 1").fetchone()
+    )
     if has_any:
         return
 
+    now = int(time.time())
     conn.execute("INSERT OR IGNORE INTO portfolios(name) VALUES (?)", ("My First Portfolio",))
+
+    # Seed a default "General" watchlist in the new multi-list tables.
+    conn.execute(
+        "INSERT OR IGNORE INTO watch_lists(name, sort_order, created_at) VALUES (?,0,?)",
+        ("General", now),
+    )
     for ticker, target in _DEFAULT_WATCHLIST.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO watch_list_items(list_name, ticker, target_price)"
+            " VALUES (?,?,?)",
+            ("General", ticker, target),
+        )
+        # Also seed the legacy flat table so the watcher still works on first run.
         conn.execute(
             "INSERT OR IGNORE INTO watch_list(ticker, target_price) VALUES (?, ?)",
             (ticker, target),
         )
+
     for group, tickers in _DEFAULT_PEER_GROUPS.items():
         conn.execute("INSERT OR IGNORE INTO peer_groups(name) VALUES (?)", (group,))
         for t in tickers:
@@ -229,9 +281,20 @@ def load_data() -> dict[str, Any]:
                 "average_cost": row["average_cost"],
             }
 
+        # Named watchlists (new multi-list structure)
+        watchlists: dict[str, dict[str, float]] = {}
+        for row in conn.execute(
+            "SELECT name FROM watch_lists ORDER BY sort_order, name"
+        ):
+            watchlists[row["name"]] = {}
+        for row in conn.execute(
+            "SELECT list_name, ticker, target_price FROM watch_list_items"
+        ):
+            watchlists.setdefault(row["list_name"], {})[row["ticker"]] = row["target_price"]
+
+        # Flat aggregated view kept for backward compat (watcher, old tab code)
         watch_list = {
-            row["ticker"]: row["target_price"]
-            for row in conn.execute("SELECT ticker, target_price FROM watch_list")
+            t: p for items in watchlists.values() for t, p in items.items()
         }
 
         peer_groups: dict[str, list[str]] = {
@@ -257,7 +320,8 @@ def load_data() -> dict[str, Any]:
 
     return {
         "portfolios": portfolios,
-        "watch_list_targets": watch_list,
+        "watchlists": watchlists,
+        "watch_list_targets": watch_list,   # flat aggregated view, for compat
         "peer_groups": peer_groups,
         "favorite_stocks": favorite_stocks,
     }
@@ -265,15 +329,15 @@ def load_data() -> dict[str, Any]:
 
 def _write_dict(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
     portfolios = data.get("portfolios", {}) or {}
-    watch_list = data.get("watch_list_targets", {}) or {}
     peer_groups = data.get("peer_groups", {}) or {}
     favorite_stocks = data.get("favorite_stocks", None)  # None = don't touch
+    # Watchlists are now managed exclusively via dedicated helpers; _write_dict
+    # no longer touches watch_list or watch_list_items.
 
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("DELETE FROM holdings")
         conn.execute("DELETE FROM portfolios")
-        conn.execute("DELETE FROM watch_list")
         conn.execute("DELETE FROM peer_group_members")
         conn.execute("DELETE FROM peer_groups")
 
@@ -291,12 +355,6 @@ def _write_dict(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
                         float(pos.get("average_cost", 0.0)),
                     ),
                 )
-
-        for ticker, target in watch_list.items():
-            conn.execute(
-                "INSERT INTO watch_list(ticker, target_price) VALUES (?, ?)",
-                (_sanitize_ticker(ticker), float(target or 0.0)),
-            )
 
         for group, tickers in peer_groups.items():
             conn.execute("INSERT OR IGNORE INTO peer_groups(name) VALUES (?)", (group,))
@@ -474,15 +532,117 @@ def record_alert(ticker: str, kind: str, target: float, price: float) -> None:
 
 
 def get_watch_targets() -> dict[str, float]:
-    """Convenience accessor for the watcher service."""
+    """Convenience accessor for the watcher service.
+    Aggregates across all named watchlists; uses the highest target when the
+    same ticker appears in multiple lists."""
     init_db()
     with _connect() as conn:
         return {
             row["ticker"]: row["target_price"]
             for row in conn.execute(
-                "SELECT ticker, target_price FROM watch_list WHERE target_price > 0"
+                """SELECT ticker, MAX(target_price) AS target_price
+                   FROM watch_list_items
+                   WHERE target_price > 0
+                   GROUP BY ticker"""
             )
         }
+
+
+# ---------- Named watchlist helpers ----------
+
+def list_watchlists() -> list[str]:
+    """Return watchlist names in display order."""
+    init_db()
+    with _connect() as conn:
+        return [
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM watch_lists ORDER BY sort_order, name"
+            )
+        ]
+
+
+def create_watchlist(name: str) -> bool:
+    """Create a new named watchlist. Returns False if the name already exists."""
+    init_db()
+    name = name.strip()
+    if not name:
+        return False
+    with _connect() as conn:
+        max_order = (
+            conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM watch_lists"
+            ).fetchone()[0]
+        )
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO watch_lists(name, sort_order, created_at)"
+            " VALUES (?,?,?)",
+            (name, max_order, int(time.time())),
+        )
+        return cur.rowcount > 0
+
+
+def rename_watchlist(old_name: str, new_name: str) -> bool:
+    """Rename a watchlist. Returns False if new_name already exists."""
+    init_db()
+    new_name = new_name.strip()
+    if not new_name or old_name == new_name:
+        return False
+    with _connect() as conn:
+        if conn.execute(
+            "SELECT 1 FROM watch_lists WHERE name = ?", (new_name,)
+        ).fetchone():
+            return False
+        # ON UPDATE CASCADE propagates the rename to watch_list_items automatically.
+        conn.execute(
+            "UPDATE watch_lists SET name = ? WHERE name = ?", (new_name, old_name)
+        )
+        return True
+
+
+def delete_watchlist(name: str) -> None:
+    """Delete a watchlist and all its tickers (CASCADE handles items)."""
+    init_db()
+    with _connect() as conn:
+        conn.execute("DELETE FROM watch_lists WHERE name = ?", (name,))
+
+
+def add_to_watchlist(list_name: str, ticker: str, target: float = 0.0) -> bool:
+    """Add a ticker to a watchlist. Returns False if already present."""
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    if not ticker:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO watch_list_items(list_name, ticker, target_price)"
+            " VALUES (?,?,?)",
+            (list_name, ticker, float(target)),
+        )
+        return cur.rowcount > 0
+
+
+def remove_from_watchlist(list_name: str, ticker: str) -> None:
+    """Remove a ticker from a watchlist."""
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM watch_list_items WHERE list_name = ? AND ticker = ?",
+            (list_name, ticker),
+        )
+
+
+def set_target_in_watchlist(list_name: str, ticker: str, target: float) -> None:
+    """Update the target price for a ticker in a specific watchlist."""
+    init_db()
+    ticker = _sanitize_ticker(ticker)
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE watch_list_items SET target_price = ?"
+            " WHERE list_name = ? AND ticker = ?",
+            (float(target), list_name, ticker),
+        )
 
 
 # ---------- Favorite stocks ----------
