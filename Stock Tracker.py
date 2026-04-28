@@ -138,11 +138,14 @@ with tab1:
     if watchlists:
         for _list_name, _items in watchlists.items():
             _list_tickers = list(_items.keys())
-            _label = (
-                f"📋 {_list_name}  ·  {len(_list_tickers)} "
-                f"stock{'s' if len(_list_tickers) != 1 else ''}"
-            )
-            with st.expander(_label, expanded=True):
+            # Keep the expander label stable — Streamlit identifies expanders
+            # by label, so embedding a live count would reset the open/closed
+            # state every time you add or remove a ticker.
+            with st.expander(f"📋 {_list_name}", expanded=True):
+                _count = len(_list_tickers)
+                st.caption(
+                    f"📊 {_count} stock{'s' if _count != 1 else ''}"
+                )
 
                 # Price table
                 if _list_tickers:
