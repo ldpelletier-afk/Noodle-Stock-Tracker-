@@ -178,6 +178,13 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_saved_articles_ticker
             ON saved_articles(ticker, saved_at DESC);
+
+        -- Tiny key/value store for persistent UI preferences (e.g. which
+        -- watchlists were left expanded). Survives app relaunches.
+        CREATE TABLE IF NOT EXISTS ui_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
     )
 
@@ -780,4 +787,50 @@ def update_saved_article_note(article_id: int, note: str) -> None:
         conn.execute(
             "UPDATE saved_articles SET note = ? WHERE id = ?",
             (note or "", int(article_id)),
+        )
+
+
+# ---------- Persistent UI preferences ----------
+
+def _ensure_ui_state(conn: sqlite3.Connection) -> None:
+    """Create the ui_state table if it doesn't exist yet. Safe to call from
+    every helper — this lets the helpers work even if the running server hadn't
+    re-run _create_schema after a code update."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ui_state ("
+        " key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+
+
+def ui_state_get(key: str, default: str = "") -> str:
+    """Read a persisted UI preference, or return `default` if absent."""
+    init_db()
+    with _connect() as conn:
+        _ensure_ui_state(conn)
+        row = conn.execute(
+            "SELECT value FROM ui_state WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def ui_state_set(key: str, value: str) -> None:
+    """Persist a UI preference."""
+    init_db()
+    with _connect() as conn:
+        _ensure_ui_state(conn)
+        conn.execute(
+            "INSERT INTO ui_state(key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+
+
+def ui_state_delete_prefix(prefix: str) -> None:
+    """Delete every UI preference whose key starts with `prefix`. Used to clean
+    up rows for renamed/deleted watchlists."""
+    init_db()
+    with _connect() as conn:
+        _ensure_ui_state(conn)
+        conn.execute(
+            "DELETE FROM ui_state WHERE key LIKE ?", (prefix + "%",)
         )

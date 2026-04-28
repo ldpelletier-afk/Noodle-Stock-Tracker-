@@ -43,6 +43,8 @@ from data_store import (
     save_article,
     save_data as _save_data_sqlite,
     set_target_in_watchlist,
+    ui_state_get,
+    ui_state_set,
     update_favorite,
     update_saved_article_note,
 )
@@ -135,18 +137,50 @@ with tab1:
         ),
     }
 
+    # ---- Per-list open/closed state, persisted across reruns + app launches ----
+    # Streamlit's st.expander cannot reliably hold the user's collapsed/expanded
+    # state across script reruns: the `expanded` arg is treated as the *initial*
+    # state, and any st.rerun() (e.g. after Add/Remove) wipes the user's toggle.
+    # We work around it by owning the state ourselves: a clickable header button
+    # toggles a session_state flag, mirrored to a tiny SQLite table so it also
+    # survives kill-and-relaunch.
+    def _wl_state_key(name: str) -> str:
+        return f"wl_open__{name}"
+
+    def _wl_is_open(name: str, default: bool = True) -> bool:
+        sk = _wl_state_key(name)
+        if sk not in st.session_state:
+            saved = ui_state_get(f"wl_open:{name}", default="1" if default else "0")
+            st.session_state[sk] = saved == "1"
+        return bool(st.session_state[sk])
+
+    def _wl_set_open(name: str, is_open: bool) -> None:
+        st.session_state[_wl_state_key(name)] = bool(is_open)
+        ui_state_set(f"wl_open:{name}", "1" if is_open else "0")
+
     if watchlists:
         for _list_name, _items in watchlists.items():
             _list_tickers = list(_items.keys())
-            # Keep the expander label stable — Streamlit identifies expanders
-            # by label, so embedding a live count would reset the open/closed
-            # state every time you add or remove a ticker.
-            with st.expander(f"📋 {_list_name}", expanded=True):
-                _count = len(_list_tickers)
-                st.caption(
-                    f"📊 {_count} stock{'s' if _count != 1 else ''}"
-                )
+            _count = len(_list_tickers)
+            _is_open = _wl_is_open(_list_name)
 
+            # Clickable header that toggles open/closed and persists the choice
+            _arrow = "🔽" if _is_open else "▶️"
+            _header_label = (
+                f"{_arrow}  📋  {_list_name}  ·  {_count} "
+                f"stock{'s' if _count != 1 else ''}"
+            )
+            if st.button(
+                _header_label,
+                key=f"wl_toggle_{_list_name}",
+                use_container_width=True,
+                help="Click to collapse" if _is_open else "Click to expand",
+            ):
+                _wl_set_open(_list_name, not _is_open)
+                st.rerun()
+
+            # Render the list contents only when this list is open
+            if _is_open:
                 # Price table
                 if _list_tickers:
                     _df = pd.DataFrame({
@@ -241,6 +275,13 @@ with tab1:
                     ):
                         if _new_name and _new_name != _list_name:
                             if rename_watchlist(_list_name, _new_name):
+                                # Migrate the persisted open/closed state to
+                                # the new name so the user's UI doesn't reset.
+                                _was_open = _wl_is_open(_list_name)
+                                _wl_set_open(_new_name, _was_open)
+                                st.session_state.pop(
+                                    _wl_state_key(_list_name), None
+                                )
                                 st.rerun()
                             else:
                                 st.warning(
@@ -256,6 +297,7 @@ with tab1:
                         use_container_width=True,
                     ):
                         delete_watchlist(_list_name)
+                        st.session_state.pop(_wl_state_key(_list_name), None)
                         st.rerun()
     else:
         st.info("No watch lists yet — create one below.")
