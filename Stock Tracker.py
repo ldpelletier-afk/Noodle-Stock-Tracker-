@@ -195,11 +195,17 @@ with tab1:
                             _items.get(t, 0.0) for t in _list_tickers
                         ],
                     })
+                    # Size the editor to show every row without an inner scrollbar.
+                    # Streamlit defaults to a fixed height (~250px / ~10 rows);
+                    # we override it so the whole list is visible at once.
+                    # ~35px per data row + ~38px header + small padding buffer.
+                    _editor_height = 38 + 35 * _count + 4
                     _edited = st.data_editor(
                         _df.style.apply(highlight_buy_zone, axis=1),
                         disabled=["Ticker", "Live Price (from API)", "Day Change (%)"],
                         hide_index=True,
                         use_container_width=True,
+                        height=_editor_height,
                         key=f"wl_editor_{_list_name}",
                         column_config=_COL_CFG,
                     )
