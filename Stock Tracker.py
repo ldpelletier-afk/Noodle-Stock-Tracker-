@@ -229,17 +229,25 @@ with tab1:
                 _ca, _cr = st.columns(2)
                 with _ca:
                     st.markdown("**Add ticker**")
-                    _add_t = sanitize_ticker(
-                        st.text_input(
+                    # Wrapped in st.form so the submit button atomically commits
+                    # the text input — otherwise a click before the input has
+                    # blurred would register an empty value and you'd need to
+                    # click twice. Pressing Enter in the input also submits.
+                    with st.form(
+                        key=f"wl_add_form_{_list_name}",
+                        clear_on_submit=True,
+                    ):
+                        _add_input = st.text_input(
                             "Ticker",
                             key=f"wl_add_{_list_name}",
                             placeholder="e.g. MSFT",
                             label_visibility="collapsed",
                         )
-                    )
-                    if st.button(
-                        "➕ Add", key=f"wl_addbtn_{_list_name}", use_container_width=True
-                    ):
+                        _add_clicked = st.form_submit_button(
+                            "➕ Add", use_container_width=True
+                        )
+                    if _add_clicked:
+                        _add_t = sanitize_ticker(_add_input)
                         if _add_t:
                             if add_to_watchlist(_list_name, _add_t):
                                 st.rerun()
@@ -269,16 +277,19 @@ with tab1:
                 st.markdown("---")
                 _cn, _cd = st.columns([4, 1])
                 with _cn:
-                    _new_name = st.text_input(
-                        "Rename list",
-                        value=_list_name,
-                        key=f"wl_rename_{_list_name}",
-                        label_visibility="collapsed",
-                        placeholder="New list name…",
-                    )
-                    if st.button(
-                        "✏️ Rename list", key=f"wl_renamebtn_{_list_name}"
+                    with st.form(
+                        key=f"wl_rename_form_{_list_name}",
+                        clear_on_submit=False,
                     ):
+                        _new_name = st.text_input(
+                            "Rename list",
+                            value=_list_name,
+                            key=f"wl_rename_{_list_name}",
+                            label_visibility="collapsed",
+                            placeholder="New list name…",
+                        )
+                        _rename_clicked = st.form_submit_button("✏️ Rename list")
+                    if _rename_clicked:
                         if _new_name and _new_name != _list_name:
                             if rename_watchlist(_list_name, _new_name):
                                 # Migrate the persisted open/closed state to
@@ -312,22 +323,26 @@ with tab1:
 
     # ---- Create new list ----
     st.subheader("➕ Create new list")
-    _nl_col1, _nl_col2 = st.columns([3, 1])
-    with _nl_col1:
-        _new_list_name = st.text_input(
-            "New list name",
-            key="wl_new_list_name",
-            placeholder="e.g. Tech Stocks",
-            label_visibility="collapsed",
-        )
-    with _nl_col2:
-        if st.button("Create", key="wl_create_list", use_container_width=True):
-            if _new_list_name.strip():
-                if create_watchlist(_new_list_name.strip()):
-                    st.toast(f"Created list '{_new_list_name}'", icon="✅")
-                    st.rerun()
-                else:
-                    st.warning(f"A list named '{_new_list_name}' already exists.")
+    with st.form(key="wl_create_list_form", clear_on_submit=True):
+        _nl_col1, _nl_col2 = st.columns([3, 1])
+        with _nl_col1:
+            _new_list_name = st.text_input(
+                "New list name",
+                key="wl_new_list_name",
+                placeholder="e.g. Tech Stocks",
+                label_visibility="collapsed",
+            )
+        with _nl_col2:
+            _create_clicked = st.form_submit_button(
+                "Create", use_container_width=True
+            )
+    if _create_clicked:
+        if _new_list_name.strip():
+            if create_watchlist(_new_list_name.strip()):
+                st.toast(f"Created list '{_new_list_name}'", icon="✅")
+                st.rerun()
+            else:
+                st.warning(f"A list named '{_new_list_name}' already exists.")
 
     st.divider()
 
