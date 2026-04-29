@@ -96,9 +96,9 @@ watch_list_targets = app_data.get("watch_list_targets", {})
 peer_groups = app_data.get("peer_groups", {})
 
 (
-    tab1, tab_fav, tab2, tab_hist, tab_risk, tab3, tab4, tab5, tab6, tab7, tab_analyst
+    tab2, tab1, tab_fav, tab_hist, tab_risk, tab3, tab4, tab5, tab6, tab7, tab_analyst
 ) = st.tabs([
-    "📈 Market Watch", "⭐ Favorites", "💼 Asset Tracker", "📒 History", "🛡️ Risk",
+    "💼 Asset Tracker", "📈 Market Watch", "⭐ Favorites", "📒 History", "🛡️ Risk",
     "⚖️ Valuation", "📰 Intelligence", "🏢 Peer Matrix", "🏦 Macro",
     "📚 The Library", "🧠 Analyst",
 ])
