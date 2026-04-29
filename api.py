@@ -641,6 +641,135 @@ def fetch_live_prices(tickers):
 
 
 @st.cache_data(ttl=3600)
+def fetch_calendar_events(tickers, days_ahead: int = 60):
+    """Fetch upcoming earnings + ex-dividend dates for the given tickers.
+
+    Returns a DataFrame sorted by Date with columns:
+      Ticker, Event, Date, Detail
+    Only events within the next `days_ahead` days are kept.
+    `tickers` should be a tuple (so streamlit can hash it for caching).
+    """
+    rows = []
+    for ticker in tickers:
+        if not ticker or ticker.upper() == "CASH":
+            continue
+        try:
+            stock = yf.Ticker(ticker)
+            try:
+                cal = stock.calendar or {}
+            except Exception:
+                cal = {}
+            try:
+                info = stock.info or {}
+            except Exception:
+                info = {}
+
+            # --- Earnings date (calendar may store a list of dates) ---
+            earn_raw = cal.get("Earnings Date")
+            earn_date = None
+            if earn_raw:
+                if isinstance(earn_raw, list) and earn_raw:
+                    earn_date = earn_raw[0]
+                else:
+                    earn_date = earn_raw
+            try:
+                earn_date = pd.to_datetime(earn_date) if earn_date else None
+            except Exception:
+                earn_date = None
+            if earn_date is not None:
+                eps_est = cal.get("Earnings Average")
+                detail = (
+                    f"EPS est: ${eps_est:.2f}"
+                    if isinstance(eps_est, (int, float))
+                    else "Earnings"
+                )
+                rows.append({
+                    "Ticker": ticker,
+                    "Event": "📊 Earnings",
+                    "Date": earn_date,
+                    "Detail": detail,
+                })
+
+            # --- Ex-dividend date ---
+            ex_raw = cal.get("Ex-Dividend Date") or info.get("exDividendDate")
+            try:
+                if isinstance(ex_raw, (int, float)):
+                    ex_date = pd.to_datetime(ex_raw, unit="s")
+                elif ex_raw:
+                    ex_date = pd.to_datetime(ex_raw)
+                else:
+                    ex_date = None
+            except Exception:
+                ex_date = None
+            if ex_date is not None:
+                amount = info.get("lastDividendValue") or info.get("dividendRate")
+                yield_raw = info.get("dividendYield") or 0
+                # yfinance is inconsistent: sometimes 0.018 (=1.8%), sometimes 1.8
+                yld_pct = yield_raw * 100 if 0 < yield_raw < 1 else yield_raw
+                detail_parts = []
+                if isinstance(amount, (int, float)) and amount > 0:
+                    detail_parts.append(f"${amount:.2f}/share")
+                if yld_pct:
+                    detail_parts.append(f"{yld_pct:.2f}% yield")
+                detail = " · ".join(detail_parts) or "Ex-dividend"
+                rows.append({
+                    "Ticker": ticker,
+                    "Event": "💰 Ex-Div",
+                    "Date": ex_date,
+                    "Detail": detail,
+                })
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=["Ticker", "Event", "Date", "Detail"])
+
+    df = pd.DataFrame(rows)
+    today = pd.Timestamp.now().normalize()
+    cutoff = today + pd.Timedelta(days=days_ahead)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df = df[(df["Date"] >= today) & (df["Date"] <= cutoff)]
+    df = df.sort_values("Date").reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=900)
+def fetch_sparkline_history(tickers, days: int = 30):
+    """Fetch closing prices for the last `days` trading days for each ticker.
+
+    Returns {ticker: [close prices, oldest first]}. Used to feed
+    st.column_config.LineChartColumn for inline sparklines.
+    `tickers` should be a tuple (hashable for caching).
+    """
+    real_tickers = [t for t in tickers if t and t.upper() != "CASH"]
+    if not real_tickers:
+        return {}
+
+    out: dict[str, list[float]] = {}
+
+    def _fetch_one(t):
+        try:
+            hist = yf.Ticker(t).history(period=f"{days + 5}d", interval="1d")
+            if not hist.empty and "Close" in hist.columns:
+                closes = hist["Close"].dropna().tail(days).tolist()
+                return t, [float(c) for c in closes]
+        except Exception:
+            pass
+        return t, []
+
+    with ThreadPoolExecutor(max_workers=min(10, len(real_tickers))) as ex:
+        futures = {ex.submit(_fetch_one, t): t for t in real_tickers}
+        for fut in as_completed(futures):
+            try:
+                ticker, closes = fut.result()
+                if closes:
+                    out[ticker] = closes
+            except Exception:
+                continue
+    return out
+
+
+@st.cache_data(ttl=3600)
 def fetch_stock_details(ticker, period):
     stock = yf.Ticker(ticker)
     period_map = {"1D": "1d", "5D": "5d", "1M": "1mo", "6M": "6mo", "YTD": "ytd", "1Y": "1y", "5Y": "5y", "Max": "max"}

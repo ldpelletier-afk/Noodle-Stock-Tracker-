@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 
 from api import (
     fetch_all_news,
+    fetch_calendar_events,
     fetch_dcf_data,
     fetch_financial_highlights,
     fetch_financial_news,
@@ -21,6 +22,7 @@ from api import (
     fetch_peer_metrics,
     fetch_recent_sec_filings,
     fetch_sec_filing,
+    fetch_sparkline_history,
     fetch_stock_details,
     fetch_url_metadata,
     fred,
@@ -128,6 +130,34 @@ with tab1:
             f"today: {', '.join(crashing_assets)}"
         )
 
+    # ---- Upcoming Calendar (earnings + ex-dividend dates) ----
+    if all_wl_tickers:
+        with st.expander("📅 Upcoming Calendar (next 60 days)", expanded=False):
+            with st.spinner("Loading earnings + dividend dates..."):
+                _cal_df = fetch_calendar_events(tuple(sorted(all_wl_tickers)))
+            if _cal_df is None or _cal_df.empty:
+                st.caption(
+                    "No upcoming earnings or ex-dividend dates found in the next "
+                    "60 days for your watchlist tickers."
+                )
+            else:
+                _cal_show = _cal_df.copy()
+                _cal_show["Date"] = _cal_show["Date"].dt.strftime("%a %b %d, %Y")
+                _cal_show["When"] = _cal_df["Date"].apply(
+                    lambda d: f"in {(d - pd.Timestamp.now().normalize()).days}d"
+                )
+                _cal_show = _cal_show[["Date", "When", "Ticker", "Event", "Detail"]]
+                st.dataframe(
+                    _cal_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(500, 38 + 35 * len(_cal_show) + 4),
+                )
+
+    # ---- Pre-fetch sparkline history for all tickers (single batched call) ----
+    with st.spinner("Loading 30-day trends..."):
+        _sparklines = fetch_sparkline_history(tuple(sorted(all_wl_tickers)))
+
     # ---- Per-list expandable sections ----
     _COL_CFG = {
         "Live Price (from API)": st.column_config.NumberColumn(format="$%.2f"),
@@ -135,7 +165,42 @@ with tab1:
         "Target Price (Self-set)": st.column_config.NumberColumn(
             format="$%.2f", step=0.01
         ),
+        "Trend (30d)": st.column_config.LineChartColumn(
+            "Trend (30d)",
+            help="Last 30 trading days of closing prices",
+            width="medium",
+        ),
     }
+
+    _SORT_OPTIONS = [
+        "Default order",
+        "Ticker A→Z",
+        "Day % (best first)",
+        "Day % (worst first)",
+        "Closest to target",
+    ]
+
+    def _apply_sort(df: pd.DataFrame, choice: str) -> pd.DataFrame:
+        if choice == "Ticker A→Z":
+            return df.sort_values("Ticker", kind="stable").reset_index(drop=True)
+        if choice == "Day % (best first)":
+            return df.sort_values(
+                "Day Change (%)", ascending=False, na_position="last", kind="stable"
+            ).reset_index(drop=True)
+        if choice == "Day % (worst first)":
+            return df.sort_values(
+                "Day Change (%)", ascending=True, na_position="last", kind="stable"
+            ).reset_index(drop=True)
+        if choice == "Closest to target":
+            def _dist(row):
+                p, t = row["Live Price (from API)"], row["Target Price (Self-set)"]
+                if p is None or t is None or t == 0:
+                    return float("inf")
+                return abs(p - t) / t
+            tmp = df.copy()
+            tmp["__d"] = tmp.apply(_dist, axis=1)
+            return tmp.sort_values("__d", kind="stable").drop(columns="__d").reset_index(drop=True)
+        return df
 
     # ---- Per-list open/closed state, persisted across reruns + app launches ----
     # Streamlit's st.expander cannot reliably hold the user's collapsed/expanded
@@ -183,6 +248,14 @@ with tab1:
             if _is_open:
                 # Price table
                 if _list_tickers:
+                    # Sort dropdown above the table
+                    _sort_choice = st.selectbox(
+                        "Sort by",
+                        _SORT_OPTIONS,
+                        key=f"wl_sort_{_list_name}",
+                        label_visibility="collapsed",
+                    )
+
                     _df = pd.DataFrame({
                         "Ticker": _list_tickers,
                         "Live Price (from API)": [
@@ -194,7 +267,9 @@ with tab1:
                         "Target Price (Self-set)": [
                             _items.get(t, 0.0) for t in _list_tickers
                         ],
+                        "Trend (30d)": [_sparklines.get(t, []) for t in _list_tickers],
                     })
+                    _df = _apply_sort(_df, _sort_choice)
                     # Size the editor to show every row without an inner scrollbar.
                     # Streamlit defaults to a fixed height (~250px / ~10 rows);
                     # we override it so the whole list is visible at once.
@@ -202,7 +277,10 @@ with tab1:
                     _editor_height = 38 + 35 * _count + 4
                     _edited = st.data_editor(
                         _df.style.apply(highlight_buy_zone, axis=1),
-                        disabled=["Ticker", "Live Price (from API)", "Day Change (%)"],
+                        disabled=[
+                            "Ticker", "Live Price (from API)",
+                            "Day Change (%)", "Trend (30d)",
+                        ],
                         hide_index=True,
                         use_container_width=True,
                         height=_editor_height,
@@ -210,14 +288,17 @@ with tab1:
                         column_config=_COL_CFG,
                     )
                     # Save any changed target prices immediately
-                    if not _edited.equals(_df):
-                        for _, _row in _edited.iterrows():
-                            _old = float(_items.get(_row["Ticker"], 0.0) or 0.0)
-                            _new = float(_row["Target Price (Self-set)"] or 0.0)
-                            if abs(_new - _old) > 1e-9:
-                                set_target_in_watchlist(
-                                    _list_name, _row["Ticker"], _new
-                                )
+                    # (compare just the editable column so sparkline lists
+                    # don't trigger spurious "changed" detections)
+                    _changes = []
+                    for _, _row in _edited.iterrows():
+                        _old = float(_items.get(_row["Ticker"], 0.0) or 0.0)
+                        _new = float(_row["Target Price (Self-set)"] or 0.0)
+                        if abs(_new - _old) > 1e-9:
+                            _changes.append((_row["Ticker"], _new))
+                    if _changes:
+                        for _t, _new in _changes:
+                            set_target_in_watchlist(_list_name, _t, _new)
                         st.toast(f"Targets updated in '{_list_name}'", icon="✅")
                         st.rerun()
                 else:
@@ -253,6 +334,53 @@ with tab1:
                                 st.rerun()
                             else:
                                 st.warning(f"{_add_t} is already in '{_list_name}'.")
+
+                    # Bulk add — paste many tickers at once
+                    with st.expander("📥 Bulk add (paste multiple tickers)"):
+                        with st.form(
+                            key=f"wl_bulk_form_{_list_name}",
+                            clear_on_submit=True,
+                        ):
+                            _bulk_text = st.text_area(
+                                "Tickers (comma, space, or newline separated)",
+                                key=f"wl_bulk_{_list_name}",
+                                placeholder="AAPL, MSFT, GOOG\nNVDA TSLA META\nAMZN",
+                                height=100,
+                            )
+                            _bulk_clicked = st.form_submit_button(
+                                "➕ Add all", use_container_width=True
+                            )
+                        if _bulk_clicked and _bulk_text.strip():
+                            # Split on any combination of commas, whitespace, or newlines
+                            import re as _re
+                            _raw = [
+                                p.strip() for p in _re.split(r"[,\s]+", _bulk_text)
+                                if p.strip()
+                            ]
+                            _seen = set()
+                            _to_add = []
+                            for _t in _raw:
+                                _clean = sanitize_ticker(_t)
+                                if _clean and _clean not in _seen:
+                                    _seen.add(_clean)
+                                    _to_add.append(_clean)
+                            _added = _skipped = 0
+                            for _clean in _to_add:
+                                if add_to_watchlist(_list_name, _clean):
+                                    _added += 1
+                                else:
+                                    _skipped += 1
+                            if _added or _skipped:
+                                _msg_parts = []
+                                if _added:
+                                    _msg_parts.append(f"added {_added}")
+                                if _skipped:
+                                    _msg_parts.append(f"skipped {_skipped} duplicate")
+                                st.toast(
+                                    f"'{_list_name}': " + ", ".join(_msg_parts),
+                                    icon="✅",
+                                )
+                                st.rerun()
                 with _cr:
                     st.markdown("**Remove ticker**")
                     if _list_tickers:
