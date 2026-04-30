@@ -734,6 +734,105 @@ def fetch_calendar_events(tickers, days_ahead: int = 60):
 
 
 @st.cache_data(ttl=900)
+def fetch_portfolio_value_history(portfolio_name=None, days: int = 365):
+    """Reconstruct portfolio value at every business day for the past `days`.
+
+    Pulls the transaction log, replays buys/sells chronologically (CASH "buy"
+    = deposit, "sell" = withdrawal), and multiplies each day's holdings by
+    historical close prices from yfinance. Returns a DataFrame with columns
+    Date and Value.
+
+    `portfolio_name=None` aggregates across every portfolio.
+    """
+    # Local import to avoid circular deps at module load
+    from data_store import fetch_transactions
+
+    txns = fetch_transactions(portfolio_name)
+    if not txns:
+        return pd.DataFrame(columns=["Date", "Value"])
+
+    txns = sorted(txns, key=lambda r: r["ts"])
+    today = pd.Timestamp.now().normalize()
+    start_dt = today - pd.Timedelta(days=days)
+    earliest_tx = pd.Timestamp(txns[0]["ts"], unit="s").normalize()
+    fetch_start = min(start_dt, earliest_tx)
+
+    # Tickers ever traded (CASH handled separately)
+    tickers = sorted({t["ticker"] for t in txns if t["ticker"].upper() != "CASH"})
+    price_series: dict[str, pd.Series] = {}
+
+    if tickers:
+        def _fetch_one(t):
+            try:
+                h = yf.Ticker(t).history(
+                    start=fetch_start.strftime("%Y-%m-%d"),
+                    end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                    interval="1d",
+                )
+                if not h.empty and "Close" in h.columns:
+                    s = h["Close"].copy()
+                    if s.index.tz is not None:
+                        s.index = s.index.tz_localize(None)
+                    s.index = s.index.normalize()
+                    return t, s
+            except Exception:
+                pass
+            return t, None
+
+        with ThreadPoolExecutor(max_workers=min(10, len(tickers))) as ex:
+            futures = {ex.submit(_fetch_one, t): t for t in tickers}
+            for fut in as_completed(futures):
+                try:
+                    tk, s = fut.result()
+                    if s is not None and not s.empty:
+                        price_series[tk] = s
+                except Exception:
+                    continue
+
+    # Replay transactions across business days, snapshotting value
+    business_days = pd.date_range(start_dt, today, freq="B")
+    rows = []
+    holdings: dict[str, float] = {}
+    cash = 0.0
+    tx_idx = 0
+
+    for date in business_days:
+        while (
+            tx_idx < len(txns)
+            and pd.Timestamp(txns[tx_idx]["ts"], unit="s").normalize() <= date
+        ):
+            tx = txns[tx_idx]
+            t = tx["ticker"]
+            q = float(tx["quantity"])
+            p = float(tx["price"])
+            action = tx["action"].upper()
+            if t.upper() == "CASH":
+                cash += q if action == "BUY" else -q
+            else:
+                if action == "BUY":
+                    holdings[t] = holdings.get(t, 0.0) + q
+                    cash -= q * p
+                elif action == "SELL":
+                    holdings[t] = holdings.get(t, 0.0) - q
+                    cash += q * p
+            tx_idx += 1
+
+        value = cash
+        for t, qty in holdings.items():
+            if qty <= 0:
+                continue
+            s = price_series.get(t)
+            if s is None or s.empty:
+                continue
+            idx = s.index.searchsorted(date, side="right") - 1
+            if 0 <= idx < len(s):
+                value += qty * float(s.iloc[idx])
+        rows.append({"Date": date, "Value": value})
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900)
 def fetch_sparkline_history(tickers, days: int = 30):
     """Fetch closing prices for the last `days` trading days for each ticker.
 
