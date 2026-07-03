@@ -3,5 +3,32 @@ yfinance
 pandas
 requests
 plotly
-dotenv
+python-dotenv
 beautifulsoup4
+numpy
+
+# LangChain — embeddings, vector store, document loaders
+langchain-community
+langchain-text-splitters
+
+# Vector store backend
+chromadb
+
+# PDF parsing (used by PyMuPDFLoader and batch_ingest)
+pymupdf
+
+# FRED economic data
+fredapi
+
+# Ollama Python client (embeddings + chat)
+ollama
+
+# JS-rendered page scraping
+playwright
+trafilatura
+
+# Analytical query engine (article corpus, catalyst history)
+duckdb
+
+# Unified LLM router (Anthropic / OpenAI / Ollama with one interface)
+litellm
