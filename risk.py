@@ -2,7 +2,7 @@
 
 Self-contained numerical module — no Streamlit UI code, no ollama, no Chroma.
 Everything here is pure pandas/numpy + a thin yfinance fetcher wrapped in
-Streamlit's cache so the UI layer can re-render without re-downloading.
+the cache shim so the UI layer can re-render without re-downloading.
 
 Public surface consumed by the UI:
     fetch_price_history(tickers, period)    -> DataFrame of close prices
@@ -32,8 +32,8 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import yfinance as yf
+from cache import cache_data
 
 TRADING_DAYS = 252
 
@@ -50,7 +50,7 @@ _FACTOR_ETFS = ["SPY", "IWM", "VTV", "VUG", "MTUM", "TLT"]
 
 # ---------- Price fetch ----------
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@cache_data(ttl=3600, show_spinner=False)
 def fetch_price_history(tickers: tuple[str, ...], period: str = "2y") -> pd.DataFrame:
     """Batched adjusted-close download. Returns wide DataFrame; missing
     tickers silently dropped. Cache key uses the tuple form so the same set
@@ -330,7 +330,7 @@ def concentration(weights: dict[str, float]) -> dict:
 
 # ---------- Factor exposure ----------
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@cache_data(ttl=3600, show_spinner=False)
 def build_factor_returns(period: str = "2y") -> pd.DataFrame:
     """Compute factor return series using ETF proxies. See module docstring
     for the factor definitions. Returns a DataFrame with columns

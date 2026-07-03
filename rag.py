@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from langchain_community.embeddings import OllamaEmbeddings
@@ -118,11 +119,13 @@ def ingest_chunks(
         category = "uncategorized"
     temporal = TEMPORAL_VALIDITY[category]
     topics = [t for t in (topics or []) if t in TOPICS]
+    now_ts = int(time.time())
     for c in chunks:
         c.metadata["doc_id"] = doc_id
         c.metadata["source"] = source_label
         c.metadata["category"] = category
         c.metadata["temporal_validity"] = temporal
+        c.metadata["ingested_at"] = now_ts
         # Write every topic column so filters are consistent — False where absent.
         for t in TOPICS:
             c.metadata[topic_key(t)] = t in topics
@@ -134,12 +137,30 @@ def list_documents() -> list[dict]:
     """Return one entry per unique doc_id in the library.
 
     Each entry: {doc_id, source, category, chunks}.
+
+    Paginates the underlying Chroma .get() call. A single unbounded fetch
+    against a large collection (≳ 30 k chunks) trips SQLite's
+    "too many SQL variables" limit and silently raises — which previously
+    made the entire library appear empty in the UI after a big ingest.
     """
-    try:
-        raw = vector_db().get(include=["metadatas"])
-    except Exception:
-        return []
-    metadatas = raw.get("metadatas") or []
+    db = vector_db()
+    metadatas: list[dict] = []
+    offset, batch = 0, 5000
+    while True:
+        try:
+            raw = db.get(limit=batch, offset=offset, include=["metadatas"])
+        except Exception:
+            # If even a paginated fetch fails, fall back to whatever we already
+            # collected rather than returning [] and hiding the library.
+            break
+        page = raw.get("metadatas") or []
+        if not page:
+            break
+        metadatas.extend(page)
+        if len(page) < batch:
+            break
+        offset += len(page)
+
     by_id: dict[str, dict] = {}
     for md in metadatas:
         if not md:
@@ -152,6 +173,16 @@ def list_documents() -> list[dict]:
             continue
         if doc_id not in by_id:
             cat = md.get("category", "uncategorized")
+            # ingested_at: use stamped value; fall back to file mtime for docs
+            # ingested before the timestamp field was added.
+            ingested_at = md.get("ingested_at")
+            if not ingested_at and doc_id.startswith("pdf::"):
+                fname = doc_id[len("pdf::"):]
+                fpath = os.path.join("./temp_pdfs", fname)
+                try:
+                    ingested_at = int(os.path.getmtime(fpath))
+                except OSError:
+                    ingested_at = None
             by_id[doc_id] = {
                 "doc_id": doc_id,
                 "source": md.get("source", doc_id),
@@ -160,6 +191,7 @@ def list_documents() -> list[dict]:
                     "temporal_validity", TEMPORAL_VALIDITY.get(cat, "unknown")
                 ),
                 "topics": topics_from_metadata(md),
+                "ingested_at": ingested_at,
                 "chunks": 0,
             }
         by_id[doc_id]["chunks"] += 1
@@ -197,7 +229,15 @@ def _resolve_chunks_for_doc(db, doc_id: str):
 
     Shared by set_category / set_topics / delete_document so mutation logic
     cannot drift.
+
+    NOTE: the legacy-fallback path used to issue a single unbounded
+    db.get(include=["metadatas"]) which trips SQLite's "too many SQL variables"
+    limit on collections beyond ~30 k chunks (silently raises and caused
+    set_category / set_topics / delete_document to no-op). The fallback now
+    paginates through the collection in 5 000-row batches, mirroring the fix
+    already applied to list_documents().
     """
+    # Fast path: chunks tagged with the doc_id metadata field — single query.
     try:
         raw = db.get(where={"doc_id": doc_id}, include=["metadatas"])
     except Exception:
@@ -207,19 +247,28 @@ def _resolve_chunks_for_doc(db, doc_id: str):
     if ids:
         return ids, metadatas
 
-    try:
-        all_raw = db.get(include=["metadatas"])
-    except Exception:
-        return [], []
-    all_ids = all_raw.get("ids") or []
-    all_metas = all_raw.get("metadatas") or []
-    for rid, md in zip(all_ids, all_metas):
-        md = md or {}
-        if md.get("doc_id"):
-            continue
-        if _derive_doc_id_from_source(md.get("source", "")) == doc_id:
-            ids.append(rid)
-            metadatas.append(md)
+    # Legacy fallback (chunks ingested pre-doc_id schema): scan everything,
+    # paginated, matching by `source` → derived doc_id.
+    offset, batch = 0, 5000
+    while True:
+        try:
+            page = db.get(limit=batch, offset=offset, include=["metadatas"])
+        except Exception:
+            break
+        page_ids   = page.get("ids") or []
+        page_metas = page.get("metadatas") or []
+        if not page_ids:
+            break
+        for rid, md in zip(page_ids, page_metas):
+            md = md or {}
+            if md.get("doc_id"):
+                continue
+            if _derive_doc_id_from_source(md.get("source", "")) == doc_id:
+                ids.append(rid)
+                metadatas.append(md)
+        if len(page_ids) < batch:
+            break
+        offset += len(page_ids)
     return ids, metadatas
 
 
@@ -369,34 +418,23 @@ def retrieve_multi(
 
 
 def _ollama_json(system: str, user: str, model: str | None = None) -> dict | None:
-    """Utility: call Ollama and parse the first {...} JSON blob in the output."""
+    """Utility: call the active LLM backend and parse the first {...} JSON blob.
+
+    The function name is kept for backward compatibility (it predates the
+    multi-backend router) — the call now goes through llm_router so it
+    honors whichever backend the user selected in the sidebar.
+    """
     try:
-        import ollama  # lazy import — only needed for reasoning features
+        from llm_router import llm_json as _llm_json
     except Exception:
         return None
     try:
-        resp = ollama.chat(
-            model=model or UTILITY_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            format="json",
-        )
-        text = resp["message"]["content"].strip()
+        return _llm_json([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])
     except Exception:
         return None
-    # Best-effort parse — format="json" usually gives clean JSON, but guard anyway.
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            return None
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
 
 
 def decompose_query(query: str, max_sub: int = 3) -> list[str]:

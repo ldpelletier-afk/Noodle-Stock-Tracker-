@@ -1,7 +1,8 @@
+import concurrent.futures as _fut
 import os
+import threading as _threading
 import time
 
-import ollama
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -17,37 +18,95 @@ from api import (
     fetch_financial_highlights,
     fetch_financial_news,
     fetch_financial_statements,
+    fetch_bea_gdp,
+    fetch_bea_pce,
+    fetch_bls_indicators,
     fetch_live_prices,
+    fetch_treasury_debt,
+    fetch_yield_curve,
+    has_bea,
+    has_eia,
+    has_fmp,
+    has_simfin,
+    has_alpha_vantage,
+    live_price_feed_status,
     fetch_macro_data,
+    fetch_simfin_statements,
+    fetch_simfin_ttm_fcf,
+    build_simfin_income_table,
+    build_simfin_balance_table,
+    build_simfin_cashflow_table,
+    fetch_fear_greed,
+    fetch_coingecko_global,
+    fetch_coingecko_top_coins,
+    fetch_commodity_prices,
+    fetch_eia_snapshot,
+    fetch_fmp_profile,
+    fetch_fmp_price_targets,
+    fetch_fmp_analyst_estimates,
+    fetch_fmp_ratings,
+    fetch_av_indicators,
+    fetch_cftc_cot,
+    fetch_cftc_snapshot,
     fetch_peer_metrics,
     fetch_portfolio_value_history,
     fetch_recent_sec_filings,
     fetch_sec_filing,
     fetch_sparkline_history,
     fetch_stock_details,
+    fetch_courtlistener_search,
     fetch_url_metadata,
+    fetch_usaspending_awards,
+    fetch_usaspending_summary,
     fred,
+    get_catalyst_news,
+    get_fomc_schedule,
+    get_major_court_cases,
+    get_treasury_refunding_schedule,
+    has_courtlistener,
+    FEDERAL_CONTRACTOR_TICKERS,
+    _CATALYST_KEYWORD_MAP,
 )
 from data_store import (
+    CATALYST_STATUSES,
+    CATALYST_STATUS_LABELS,
+    CATALYST_TYPES,
+    CATALYST_TYPE_LABELS,
+    add_catalyst,
     add_favorite,
+    add_institution,
     add_to_watchlist,
     create_watchlist,
+    delete_catalyst,
+    get_catalyst,
     delete_saved_article,
     delete_watchlist,
     fetch_transactions,
     import_transactions,
+    link_catalyst_doc,
+    link_institution_doc,
+    list_catalysts,
     list_favorites,
+    list_institution_docs,
+    list_institutional_coverage,
     list_saved_articles,
     load_data as _load_data_sqlite,
     log_transaction,
     remove_favorite,
     remove_from_watchlist,
+    remove_institution,
     rename_watchlist,
     save_article,
     save_data as _save_data_sqlite,
+    set_primary_institution_doc,
     set_target_in_watchlist,
     ui_state_get,
     ui_state_set,
+    unlink_catalyst_doc,
+    unlink_doc_from_all_catalysts,
+    unlink_doc_from_all_institutions,
+    unlink_institution_doc,
+    update_catalyst,
     update_favorite,
     update_saved_article_note,
 )
@@ -83,12 +142,33 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 st.set_page_config(page_title="The True Oracle", layout="wide")
 
 
-def load_data():
+@st.cache_data(ttl=60)
+def _load_data_cached(_token: int):
+    """Cached pull of the full app dict (portfolios + watchlists + peer_groups
+    + favorites). The `_token` arg is the cache-busting handle: bump it via
+    `_invalidate_app_data()` after any write so the next load_data() re-reads.
+
+    A short TTL (60 s) is a belt-and-suspenders fallback so manual edits to
+    portfolio.db (or out-of-band updates from the watcher service) eventually
+    propagate even if some code path forgets to invalidate.
+    """
     return _load_data_sqlite()
+
+
+def load_data():
+    """Render-cycle cache for the app dict. Saves dozens of full SQLite reads
+    per Streamlit rerun (every widget interaction used to hit the DB)."""
+    return _load_data_cached(st.session_state.get("_app_data_token", 0))
+
+
+def _invalidate_app_data() -> None:
+    """Bump the cache token so the next load_data() picks up DB writes."""
+    st.session_state["_app_data_token"] = st.session_state.get("_app_data_token", 0) + 1
 
 
 def save_data(data):
     _save_data_sqlite(data)
+    _invalidate_app_data()
 
 # --- MAIN APP ---
 st.title("The True Oracle: Valuation & Tracking")
@@ -98,23 +178,338 @@ portfolios = app_data.get("portfolios", {})
 watch_list_targets = app_data.get("watch_list_targets", {})
 peer_groups = app_data.get("peer_groups", {})
 
-(
-    tab_dash, tab2, tab1, tab_fav, tab_hist, tab_risk, tab3, tab4, tab5, tab6, tab7, tab_analyst
-) = st.tabs([
-    "🏠 Dashboard", "💼 Asset Tracker", "📈 Market Watch", "⭐ Favorites",
-    "📒 History", "🛡️ Risk", "⚖️ Valuation", "📰 Intelligence",
-    "🏢 Peer Matrix", "🏦 Macro", "📚 The Library", "🧠 Analyst",
-])
+# ---- Lazy-load session state: tracks which tabs have fetched live data ----
+if "_lazy_loaded" not in st.session_state:
+    st.session_state._lazy_loaded = set()
+
+# ---- Background pre-fetch: warm caches for heavy tabs in a daemon thread ----
+# Streamlit's cache_data is process-wide, so the thread populates the same
+# cache the main thread reads from — fetches are instant when user navigates
+# AFTER the prefetch finishes. Runs once per session at module-load time and
+# again on demand via the dashboard "⚡ Power-load all" button.
+def _bg_prefetch(deep: bool = False):
+    """Warm the most-touched caches.
+
+    `deep=True` adds the heavier optional fetches (Library doc list, macro
+    series, sentiment, news) so the user pays a single cold-cache cost upfront
+    and every tab feels instant for the rest of the session.
+    """
+    _wl_tickers = sorted(
+        t
+        for items in app_data.get("watchlists", {}).values()
+        for t in items
+        if t and t.upper() != "CASH"
+    )
+    _fav_tickers = list(
+        t for t in (app_data.get("favorites") or {}).keys()
+        if t and t.upper() != "CASH"
+    )
+    # ── Tier 1: cheap and high-leverage (live prices, sparklines) ──
+    if _wl_tickers:
+        try:
+            fetch_live_prices(_wl_tickers)
+            fetch_sparkline_history(tuple(sorted(_wl_tickers)))
+        except Exception:
+            pass
+    if _fav_tickers:
+        try:
+            fetch_live_prices(_fav_tickers)
+        except Exception:
+            pass
+
+    if not deep:
+        return
+
+    # ── Tier 2: macro / sentiment (always-on signals used by Library Oracle) ──
+    try:
+        if fred:
+            fetch_macro_data("FEDFUNDS")
+            fetch_macro_data("BAMLH0A0HYM2")
+            fetch_macro_data("DGS10")
+    except Exception:
+        pass
+    try:
+        fetch_fear_greed()
+    except Exception:
+        pass
+
+    # ── Tier 3: Library doc list (paginated 78k+ chunk fetch is now ~1-2s) ──
+    try:
+        from rag import list_documents as _ld
+        _ld()
+    except Exception:
+        pass
+
+    # ── Tier 4: Calendar events for watch-listed tickers (Dashboard tile) ──
+    if _wl_tickers:
+        try:
+            fetch_calendar_events(tuple(sorted(_wl_tickers))[:10])
+        except Exception:
+            pass
+
+if "_bg_prefetch_started" not in st.session_state:
+    st.session_state._bg_prefetch_started = True
+    _threading.Thread(target=_bg_prefetch, daemon=True).start()
+
+# ---- LLM backend selector (sidebar) -------------------------------------
+# Lets the user switch between local Ollama (free) and Anthropic Claude
+# (paid API) on the fly. Anthropic options auto-hide when no API key is set.
+import llm_router as _llm_router
+
+_llm_options = _llm_router.available_backends()
+_llm_labels = {bid: _llm_router.BACKENDS[bid]["label"] for bid in _llm_options}
+
+# Pick the previously-selected backend if it's still valid; else default.
+_default_backend = st.session_state.get("llm_backend") or _llm_router.get_backend()
+if _default_backend not in _llm_options:
+    _default_backend = _llm_options[0]
+
+with st.sidebar:
+    st.markdown("### 🤖 LLM Engine")
+    _chosen = st.selectbox(
+        "Active model for synthesis & analysis",
+        options=_llm_options,
+        index=_llm_options.index(_default_backend),
+        format_func=lambda bid: _llm_labels.get(bid, bid),
+        key="_llm_backend_select",
+        label_visibility="collapsed",
+    )
+    st.session_state.llm_backend = _chosen
+    _llm_router.set_backend(_chosen)
+
+    if not _llm_router.has_anthropic_key():
+        st.caption(
+            "💡 Add `ANTHROPIC_API_KEY=...` to `.env` to unlock Claude models. "
+            "Until then, Ollama is the only option."
+        )
+    else:
+        _provider = _llm_router.BACKENDS[_chosen]["provider"]
+        if _provider == "anthropic":
+            st.caption("☁️ Calls bill against your Anthropic API credits.")
+        else:
+            st.caption("💻 Running locally via Ollama — free, no network calls.")
+
+# ===========================
+# STATEFUL NAVIGATION (two-level)
+# ===========================
+# Top-level supergroup: Finance vs Catalysts. Each supergroup remembers its
+# own active subtab independently, so flipping back and forth between them
+# never loses your place. All persistence is automatic via Streamlit widget
+# keys — no manual session_state writes needed.
+_SUPERGROUPS = ["💰 Finance", "🌍 Catalysts"]
+_FINANCE_TABS = [
+    "🏠 Dashboard",
+    "💼 Asset Tracker",
+    "📈 Market Watch",
+    "⭐ Favorites",
+    "📒 History",
+    "🛡️ Risk",
+    "⚖️ Valuation",
+    "📰 Intelligence",
+    "🏢 Peer Matrix",
+    "🌐 Global Markets",
+    "📚 The Library",
+    "🧠 Analyst",
+]
+_CATALYST_TABS = [
+    "🎯 Catalyst Calendar",
+    "🏛️ Monetary Policy",
+    "🏗️ Federal Contracts",
+    "⚖️ Court Docket",
+    "📰 Catalyst News",
+]
+
+# Defensive defaults — every key initialised so first-render never blanks.
+st.session_state.setdefault("supergroup", _SUPERGROUPS[0])
+st.session_state.setdefault("active_finance_tab",  _FINANCE_TABS[0])
+st.session_state.setdefault("active_catalyst_tab", _CATALYST_TABS[0])
+# Snap back if a persisted label drifted (e.g. label-rename across versions)
+if st.session_state["supergroup"] not in _SUPERGROUPS:
+    st.session_state["supergroup"] = _SUPERGROUPS[0]
+if st.session_state["active_finance_tab"] not in _FINANCE_TABS:
+    st.session_state["active_finance_tab"] = _FINANCE_TABS[0]
+if st.session_state["active_catalyst_tab"] not in _CATALYST_TABS:
+    st.session_state["active_catalyst_tab"] = _CATALYST_TABS[0]
+
+# Row 1 — supergroup selector. Visually a segmented strip across the top.
+st.radio(
+    "Section",
+    options=_SUPERGROUPS,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="supergroup",
+)
+_supergroup = st.session_state["supergroup"]
+
+# Row 2 — subtab strip whose options depend on the active supergroup.
+if _supergroup == "💰 Finance":
+    st.radio(
+        "Finance section",
+        options=_FINANCE_TABS,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_finance_tab",
+    )
+    _active = st.session_state["active_finance_tab"]
+else:
+    st.radio(
+        "Catalyst section",
+        options=_CATALYST_TABS,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_catalyst_tab",
+    )
+    _active = st.session_state["active_catalyst_tab"]
+
+# =============================================================================
+#  CATALYST HELPERS (defined globally so the Analyst tab can also render them)
+# =============================================================================
+# Both the Analyst tab (transparency panel showing which catalysts the LLM
+# saw) and the Catalysts supergroup (calendar / monetary / contracts subtabs)
+# render catalyst cards. Defining the helpers here — above the per-tab `if`
+# blocks — guarantees they exist regardless of which tab is currently active.
+
+import datetime as _dt
+
+
+def _format_event_date(ts: int) -> str:
+    """Human-friendly date label, with a relative countdown for the bulletin."""
+    if not ts:
+        return "—"
+    d   = _dt.datetime.fromtimestamp(int(ts))
+    now = _dt.datetime.now()
+    delta_days = (d.date() - now.date()).days
+    base = d.strftime("%a %b %d, %Y")
+    if delta_days == 0:
+        return f"{base}  ·  **today**"
+    if delta_days == 1:
+        return f"{base}  ·  tomorrow"
+    if delta_days == -1:
+        return f"{base}  ·  yesterday"
+    if 0 < delta_days <= 30:
+        return f"{base}  ·  in {delta_days} days"
+    if -30 <= delta_days < 0:
+        return f"{base}  ·  {-delta_days} days ago"
+    return base
+
+
+def _render_catalyst_card(c: dict, expanded: bool = False) -> None:
+    """One catalyst, rendered as an expandable card. Edit/delete inline."""
+    type_label   = CATALYST_TYPE_LABELS.get(c.get("catalyst_type"), c.get("catalyst_type", ""))
+    status_label = CATALYST_STATUS_LABELS.get(c.get("status"), c.get("status", ""))
+    date_label   = _format_event_date(c.get("event_date"))
+
+    header = f"**{c.get('title','(untitled)')}**"
+    summary_line = f"{type_label}  ·  {status_label}  ·  {date_label}"
+
+    with st.expander(f"{header} — {summary_line}", expanded=expanded):
+        # Stakes (the analytical core) — markdown rendered.
+        if c.get("stakes"):
+            st.markdown(c["stakes"])
+        else:
+            st.caption("_No stakes recorded yet — click ✏️ Edit to add._")
+
+        # Compact metadata grid
+        meta_cols = st.columns(4)
+        if c.get("category"):
+            meta_cols[0].caption(f"**Category**\n\n{c['category']}")
+        if c.get("probability"):
+            meta_cols[1].caption(f"**Probability**\n\n{c['probability']}")
+        if c.get("tickers"):
+            meta_cols[2].caption("**Tickers**\n\n" + " ".join(f"`{t}`" for t in c["tickers"]))
+        if c.get("sectors"):
+            meta_cols[3].caption("**Sectors**\n\n" + ", ".join(c["sectors"]))
+
+        # Resolution outcome (only for resolved entries)
+        if c.get("status") == "resolved" and c.get("outcome_notes"):
+            st.success(f"**Outcome:** {c['outcome_notes']}")
+
+        # Linked Library docs
+        if c.get("doc_ids"):
+            with st.expander(f"📎 Linked library docs ({len(c['doc_ids'])})"):
+                for did in c["doc_ids"]:
+                    st.markdown(f"- `{did}`")
+
+        # Action row
+        ac1, ac2, ac3 = st.columns([1, 1, 6])
+        if ac1.button("✏️ Edit", key=f"cat_edit_{c['id']}"):
+            st.session_state["_catalyst_edit_id"] = c["id"]
+            st.session_state["_catalyst_form_open"] = True
+            st.rerun()
+        if ac3.button("🗑️ Delete", key=f"cat_del_{c['id']}",
+                      help="Permanently remove this catalyst"):
+            delete_catalyst(c["id"])
+            st.toast(f"Deleted: {c.get('title','(untitled)')}", icon="🗑️")
+            st.rerun()
+
 
 # ===========================
 # TAB: DASHBOARD (homepage)
 # ===========================
-with tab_dash:
+if _active == "🏠 Dashboard":
     st.header("🏠 Dashboard")
     st.caption(
         "Portfolio performance overview, reconstructed live from your transaction "
         "history × current prices."
     )
+
+    # ---- Unified live-data loader ----
+    # One button activates the live-data tabs (Market Watch / Favorites / Asset
+    # Tracker) AND warms the heavy upstream caches that the Library Oracle and
+    # Analyst depend on (FRED macro series, CNN F&G, Library doc list, calendar
+    # events). Pay one cold-cache hit here, every tab afterwards is instant.
+    _LIVE_TARGETS = ("market_watch", "favorites", "asset_tracker")
+    _all_live_loaded = all(
+        _t in st.session_state._lazy_loaded for _t in _LIVE_TARGETS
+    )
+
+    _ldc1, _ldc2 = st.columns([1, 4])
+    with _ldc1:
+        if _all_live_loaded:
+            if st.button("🔄 Refresh live data", key="dash_refresh_btn",
+                         help="Re-fetch prices, sparklines, and calendar events."):
+                fetch_live_prices.clear()
+                fetch_sparkline_history.clear()
+                try:
+                    fetch_calendar_events.clear()
+                except Exception:
+                    pass
+                st.rerun()
+        else:
+            if st.button("⚡ Power-load all", key="dash_load_btn",
+                         type="primary",
+                         help="One click: warms live prices, sparklines, calendar events, "
+                              "FRED macro series, CNN F&G, and the full Library doc list. "
+                              "Takes 5–15 s on a cold start; afterwards every tab is instant."):
+                for _t in _LIVE_TARGETS:
+                    st.session_state._lazy_loaded.add(_t)
+                # Run a synchronous deep prefetch so the user sees the spinner
+                # finish before the page lights up — matches the request's
+                # "I don't mind a little wait" framing.
+                with st.spinner("Warming caches across all tabs (live prices, macro, sentiment, library)…"):
+                    _bg_prefetch(deep=True)
+                st.toast("All caches warmed — every tab is now snappy.", icon="⚡")
+                st.rerun()
+    with _ldc2:
+        _feed = live_price_feed_status()
+        if _feed["alpaca_configured"]:
+            _feed_badge = f"📡 **Feed:** {_feed['label']} · auto-refresh every {_feed['ttl_seconds']}s"
+        else:
+            _feed_badge = (
+                f"📡 **Feed:** {_feed['label']} · auto-refresh every {_feed['ttl_seconds']}s "
+                "_(add `ALPACA_API_KEY` + `ALPACA_SECRET_KEY` to `.env` for real-time IEX data)_"
+            )
+        if _all_live_loaded:
+            st.caption(f"✅ Live data is loaded across Market Watch, Favorites, and Asset Tracker.\n\n{_feed_badge}")
+        else:
+            st.caption(
+                "Click once to warm every tab's caches — live prices, sparklines, "
+                "calendar events, FRED macro, sentiment, and the full document library. "
+                "After this finishes, every navigation feels instant.\n\n"
+                + _feed_badge
+            )
+
+    st.divider()
 
     # ---- Portfolio selector ----
     _portfolio_names = list(portfolios.keys())
@@ -391,14 +786,29 @@ with tab_dash:
 # ===========================
 # TAB 1: MARKET WATCH
 # ===========================
-with tab1:
+if _active == "📈 Market Watch":
     watchlists = app_data.get("watchlists", {})
 
-    # Collect every ticker across all lists for a single bulk price fetch.
-    all_wl_tickers = list({t for items in watchlists.values() for t in items})
+    # Sorted list for deterministic cache keys — matches the background pre-fetch.
+    all_wl_tickers = sorted({t for items in watchlists.values() for t in items})
 
-    with st.spinner("Fetching live market data..."):
-        live_prices = fetch_live_prices(all_wl_tickers)
+    _mw_ready = "market_watch" in st.session_state._lazy_loaded
+
+    if not _mw_ready:
+        # Live fetches are gated by the unified Dashboard loader. Until the
+        # user clicks the Dashboard's "Load all live data", we render the
+        # static watchlist without prices/sparklines.
+        live_prices = {}
+        _sparklines = {}
+        st.caption(
+            "📡 Live prices not loaded yet — click **⚡ Load all live data** on the "
+            "🏠 Dashboard tab to populate prices, sparklines, and the calendar."
+        )
+    else:
+        with st.spinner("Fetching live market data..."):
+            live_prices = fetch_live_prices(all_wl_tickers)
+        with st.spinner("Loading 30-day trends..."):
+            _sparklines = fetch_sparkline_history(tuple(sorted(all_wl_tickers)))
 
     # Global volatility alert (across every list)
     crashing_assets = [
@@ -416,30 +826,29 @@ with tab1:
     # ---- Upcoming Calendar (earnings + ex-dividend dates) ----
     if all_wl_tickers:
         with st.expander("📅 Upcoming Calendar (next 60 days)", expanded=False):
-            with st.spinner("Loading earnings + dividend dates..."):
-                _cal_df = fetch_calendar_events(tuple(sorted(all_wl_tickers)))
-            if _cal_df is None or _cal_df.empty:
-                st.caption(
-                    "No upcoming earnings or ex-dividend dates found in the next "
-                    "60 days for your watchlist tickers."
-                )
+            if _mw_ready:
+                with st.spinner("Loading earnings + dividend dates..."):
+                    _cal_df = fetch_calendar_events(tuple(sorted(all_wl_tickers)))
+                if _cal_df is None or _cal_df.empty:
+                    st.caption(
+                        "No upcoming earnings or ex-dividend dates found in the next "
+                        "60 days for your watchlist tickers."
+                    )
+                else:
+                    _cal_show = _cal_df.copy()
+                    _cal_show["Date"] = _cal_show["Date"].dt.strftime("%a %b %d, %Y")
+                    _cal_show["When"] = _cal_df["Date"].apply(
+                        lambda d: f"in {(d - pd.Timestamp.now().normalize()).days}d"
+                    )
+                    _cal_show = _cal_show[["Date", "When", "Ticker", "Event", "Detail"]]
+                    st.dataframe(
+                        _cal_show,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(500, 38 + 35 * len(_cal_show) + 4),
+                    )
             else:
-                _cal_show = _cal_df.copy()
-                _cal_show["Date"] = _cal_show["Date"].dt.strftime("%a %b %d, %Y")
-                _cal_show["When"] = _cal_df["Date"].apply(
-                    lambda d: f"in {(d - pd.Timestamp.now().normalize()).days}d"
-                )
-                _cal_show = _cal_show[["Date", "When", "Ticker", "Event", "Detail"]]
-                st.dataframe(
-                    _cal_show,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(500, 38 + 35 * len(_cal_show) + 4),
-                )
-
-    # ---- Pre-fetch sparkline history for all tickers (single batched call) ----
-    with st.spinner("Loading 30-day trends..."):
-        _sparklines = fetch_sparkline_history(tuple(sorted(all_wl_tickers)))
+                st.caption("Load live data above to see upcoming events.")
 
     # ---- Per-list expandable sections ----
     _COL_CFG = {
@@ -839,7 +1248,7 @@ with tab1:
 # ===========================
 # TAB: FAVORITES
 # ===========================
-with tab_fav:
+if _active == "⭐ Favorites":
     st.header("⭐ Favorite Stocks")
     st.caption(
         "A curated, high-attention list — track goals, notes, financials, SEC filings, "
@@ -850,10 +1259,19 @@ with tab_fav:
     favorites = list_favorites()
     fav_tickers = list(favorites.keys())
 
+    _fav_ready = "favorites" in st.session_state._lazy_loaded
+
     # ---- Summary strip across all favorites ----
     if fav_tickers:
-        with st.spinner("Fetching live data for your favorites..."):
-            fav_prices = fetch_live_prices(fav_tickers)
+        if not _fav_ready:
+            fav_prices = {}
+            st.caption(
+                "📡 Live prices not loaded yet — click **⚡ Load all live data** on "
+                "the 🏠 Dashboard tab to populate this summary."
+            )
+        else:
+            with st.spinner("Fetching live data for your favorites..."):
+                fav_prices = fetch_live_prices(fav_tickers)
 
         summary_rows = []
         for t in fav_tickers:
@@ -1273,7 +1691,7 @@ with tab_fav:
 # ===========================
 # TAB 2: ASSET TRACKER
 # ===========================
-with tab2:
+if _active == "💼 Asset Tracker":
     st.header("Portfolio Asset Tracker")
     with st.expander("Creating and Managing Portfolios", expanded=not bool(portfolios)):
         col_p1, col_p2 = st.columns([3, 1])
@@ -1373,8 +1791,16 @@ with tab2:
 
     if current_holdings:
         holding_tickers = list(current_holdings.keys())
-        with st.spinner("Fetching live prices for holdings..."):
-            holding_prices = fetch_live_prices(holding_tickers)
+        _at_ready = "asset_tracker" in st.session_state._lazy_loaded
+        if not _at_ready:
+            st.caption(
+                "📡 Live prices not loaded yet — click **⚡ Load all live data** on "
+                "the 🏠 Dashboard tab to populate current values."
+            )
+            holding_prices = {}
+        else:
+            with st.spinner("Fetching live prices for holdings..."):
+                holding_prices = fetch_live_prices(holding_tickers)
         
         holdings_data = []
         total_portfolio_value = 0
@@ -1444,7 +1870,7 @@ with tab2:
 # ===========================
 # TAB HISTORY: TRADE LEDGER & REALIZED P&L
 # ===========================
-with tab_hist:
+if _active == "📒 History":
     st.header("📒 Trade History & Realized P&L")
     st.caption("Every buy and sell you make is recorded here. Realized P&L is calculated from sales only — unrealized gains on open positions are shown in the Asset Tracker.")
 
@@ -1613,7 +2039,7 @@ with tab_hist:
 # ===========================
 # TAB RISK: PORTFOLIO RISK DASHBOARD
 # ===========================
-with tab_risk:
+if _active == "🛡️ Risk":
     st.header("🛡️ Portfolio Risk Dashboard")
     st.caption(
         "VaR, drawdown, correlation, beta, and factor exposure on your "
@@ -1915,42 +2341,70 @@ with tab_risk:
 # ===========================
 # TAB 3: THE VALUATION MACHINE
 # ===========================
-with tab3:
+if _active == "⚖️ Valuation":
     st.header("The Valuation Machine")
-    st.markdown("Calculate the true Intrinsic Value of an asset based on its future cash generation capabilities.")
-    
-    st.subheader("Asset Selection")
-    val_ticker = sanitize_ticker(st.text_input("Enter Ticker to Value", value="AAPL", key="val_input").upper())
-    
-    st.write("---")
-    st.markdown("**The Math:**")
-    st.markdown(r"$$PV = \sum_{t=1}^{n} \frac{FCF_t}{(1+r)^t} + \frac{TV}{(1+r)^n}$$")
-    st.caption("$FCF$ = Free Cash Flow | $r$ = Discount Rate | $TV$ = Terminal Value")
-    st.divider()
-    
-    st.subheader("Philosophical Assumptions")
-    c_assump1, c_assump2, c_assump3 = st.columns(3)
-    with c_assump1: discount_rate = st.slider("Discount Rate (r)", min_value=0.01, max_value=0.20, value=0.10, step=0.01)
-    with c_assump2: growth_rate = st.slider("Growth Rate (Years 1-5)", min_value=-0.10, max_value=0.50, value=0.08, step=0.01)
-    with c_assump3: terminal_rate = st.slider("Terminal Growth Rate", min_value=0.01, max_value=0.05, value=0.025, step=0.005)
 
-    if val_ticker and st.button("Calculate Intrinsic Value", use_container_width=True, type="primary"):
-        with st.spinner(f"Auditing financial statements for {val_ticker}..."):
-            fcf, shares, current_price = fetch_dcf_data(val_ticker)
-            if fcf is None or shares is None or current_price is None: st.error("Insufficient financial data available from Yahoo Finance.")
-            elif fcf <= 0: st.warning(f"{val_ticker} currently generates negative Free Cash Flow. Standard DCF model collapses.")
+    # Shared ticker input — used by both subtabs
+    val_ticker = sanitize_ticker(
+        st.text_input("Ticker", value="AAPL", key="val_input").upper()
+    )
+
+    _val_dcf, _val_sf, _val_tech = st.tabs([
+        "📐 DCF Calculator",
+        "📋 Fundamentals (SimFin)",
+        "📊 Technical Signals (Alpha Vantage)",
+    ])
+
+    # ------------------------------------------------------------------
+    # DCF CALCULATOR
+    # ------------------------------------------------------------------
+    with _val_dcf:
+        st.markdown("Calculate intrinsic value based on future free cash flow generation.")
+        st.markdown(r"$$PV = \sum_{t=1}^{n} \frac{FCF_t}{(1+r)^t} + \frac{TV}{(1+r)^n}$$")
+        st.caption("$FCF$ = Free Cash Flow | $r$ = Discount Rate | $TV$ = Terminal Value")
+        st.divider()
+
+        st.subheader("Assumptions")
+        c_assump1, c_assump2, c_assump3 = st.columns(3)
+        with c_assump1:
+            discount_rate = st.slider("Discount Rate (r)", min_value=0.01, max_value=0.20, value=0.10, step=0.01)
+        with c_assump2:
+            growth_rate = st.slider("Growth Rate (Years 1–5)", min_value=-0.10, max_value=0.50, value=0.08, step=0.01)
+        with c_assump3:
+            terminal_rate = st.slider("Terminal Growth Rate", min_value=0.01, max_value=0.05, value=0.025, step=0.005)
+
+        if val_ticker and st.button("Calculate Intrinsic Value", use_container_width=True, type="primary", key="dcf_calc_btn"):
+            # --- Prefer SimFin TTM FCF; fall back to yfinance ---
+            _sf_fcf, _sf_shares = fetch_simfin_ttm_fcf(val_ticker) if has_simfin() else (None, None)
+            with st.spinner(f"Auditing financials for {val_ticker}..."):
+                _yf_fcf, _yf_shares, current_price = fetch_dcf_data(val_ticker)
+
+            if _sf_fcf is not None and _sf_shares is not None:
+                fcf, shares = _sf_fcf, _sf_shares
+                st.caption("📊 FCF & shares sourced from **SimFin TTM** — more reliable than yfinance.")
+            else:
+                fcf, shares = _yf_fcf, _yf_shares
+                if has_simfin():
+                    st.caption("⚠️ SimFin didn't return data for this ticker — falling back to yfinance.")
+                else:
+                    st.caption("💡 Add `SIMFIN_API_KEY` to `.env` for more reliable TTM FCF data.")
+
+            if fcf is None or shares is None or current_price is None:
+                st.error("Insufficient financial data available.")
+            elif fcf <= 0:
+                st.warning(f"{val_ticker} has negative trailing FCF (${fcf:,.0f}). Standard DCF collapses.")
             else:
                 projected_cf, current_fcf = [], fcf
                 for year in range(1, 6):
                     current_fcf *= (1 + growth_rate)
                     projected_cf.append(current_fcf / ((1 + discount_rate) ** year))
-                
+
                 sum_pv_cf = sum(projected_cf)
                 terminal_value = (current_fcf * (1 + terminal_rate)) / (discount_rate - terminal_rate)
                 pv_terminal_value = terminal_value / ((1 + discount_rate) ** 5)
                 intrinsic_value_per_share = (sum_pv_cf + pv_terminal_value) / shares
                 margin_of_safety = ((intrinsic_value_per_share - current_price) / intrinsic_value_per_share) * 100
-                
+
                 st.divider()
                 res_col1, res_col2, res_col3 = st.columns(3)
                 res_col1.metric("Live Market Price", f"${current_price:.2f}")
@@ -1963,14 +2417,227 @@ with tab3:
 
                 st.write("**Audit Breakdown:**")
                 st.table(pd.DataFrame({
-                    "Metric": ["Trailing Free Cash Flow", "Shares Outstanding", "Sum of PV (5 Years)", "PV of Terminal Value", "Total Enterprise Value"],
-                    "Value": [format_large_number(fcf), format_large_number(shares), format_large_number(sum_pv_cf), format_large_number(pv_terminal_value), format_large_number(sum_pv_cf + pv_terminal_value)]
+                    "Metric": ["Trailing FCF (input)", "Shares Outstanding", "Sum of PV (5 Years)", "PV of Terminal Value", "Total Enterprise Value"],
+                    "Value":  [format_large_number(fcf), format_large_number(shares),
+                               format_large_number(sum_pv_cf), format_large_number(pv_terminal_value),
+                               format_large_number(sum_pv_cf + pv_terminal_value)],
                 }))
+
+    # ------------------------------------------------------------------
+    # FUNDAMENTALS — SimFin
+    # ------------------------------------------------------------------
+    with _val_sf:
+        if not has_simfin():
+            st.warning("🔑 SimFin API key not configured.")
+            st.info(
+                "Get a **free** key at [app.simfin.com](https://app.simfin.com) "
+                "(Settings → API Key), then add `SIMFIN_API_KEY=your_key` to `.env` and restart.\n\n"
+                "Gives you clean, standardised GAAP financials for 2,000+ US companies — "
+                "far more reliable than yfinance for income statements, balance sheets, and cash flow."
+            )
+        elif val_ticker:
+            with st.spinner(f"Fetching SimFin statements for {val_ticker}..."):
+                _sf_stmts = fetch_simfin_statements(val_ticker, period="annual")
+
+            if not _sf_stmts or all(v is None for v in _sf_stmts.values()):
+                st.warning(
+                    f"No SimFin data found for **{val_ticker}**. "
+                    "SimFin covers US-listed equities — international or OTC tickers may not be available."
+                )
+            else:
+                _sf_inc = _sf_stmts.get("income")
+                _sf_bs  = _sf_stmts.get("balance")
+                _sf_cf  = _sf_stmts.get("cashflow")
+                _sf_der = _sf_stmts.get("derived")
+
+                # ---- Scorecard (derived metrics, latest year) ----
+                if _sf_der is not None and not _sf_der.empty:
+                    st.markdown(f"#### Key Ratios — {val_ticker} (latest annual)")
+                    _sc = st.columns(5)
+                    _der_row = _sf_der.iloc[0]
+                    _kpi_map = [
+                        ("Gross Profit Margin",    "Gross Margin",   "{}%"),
+                        ("Operating Profit Margin","Op. Margin",     "{}%"),
+                        ("Net Profit Margin",       "Net Margin",     "{}%"),
+                        ("Return on Equity",        "ROE",            "{}%"),
+                        ("Return on Assets",        "ROA",            "{}%"),
+                    ]
+                    for _ci, (_col, _label, _fmt) in enumerate(_kpi_map):
+                        _v = _der_row.get(_col)
+                        try:
+                            _sc[_ci].metric(_label, f"{float(_v):.1f}%")
+                        except Exception:
+                            _sc[_ci].metric(_label, "—")
+                    st.divider()
+
+                # ---- Statement selector ----
+                _sf_view = st.radio(
+                    "Statement",
+                    ["📈 Income Statement", "🏦 Balance Sheet", "💵 Cash Flow"],
+                    horizontal=True,
+                    key="sf_stmt_radio",
+                )
+
+                if _sf_view == "📈 Income Statement":
+                    tbl = build_simfin_income_table(_sf_inc)
+                    if tbl is not None:
+                        st.dataframe(tbl, use_container_width=True)
+                        # Revenue trend chart
+                        if _sf_inc is not None and "Revenue" in _sf_inc.columns and "Fiscal Year" in _sf_inc.columns:
+                            _rev_df = _sf_inc[["Fiscal Year", "Revenue", "Gross Profit", "Net Income"]].dropna().copy()
+                            _rev_df = _rev_df.sort_values("Fiscal Year")
+                            for _c in ["Revenue", "Gross Profit", "Net Income"]:
+                                _rev_df[_c] = pd.to_numeric(_rev_df[_c], errors="coerce") / 1e9
+                            _fig_inc = px.line(
+                                _rev_df, x="Fiscal Year",
+                                y=["Revenue", "Gross Profit", "Net Income"],
+                                title=f"{val_ticker} — Revenue, Gross Profit & Net Income (Billions $)",
+                                markers=True,
+                            )
+                            _fig_inc.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+                            _fig_inc.update_xaxes(showgrid=False)
+                            _fig_inc.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)", title="$B")
+                            st.plotly_chart(_fig_inc, use_container_width=True)
+                    else:
+                        st.info("Income statement data not available.")
+
+                elif _sf_view == "🏦 Balance Sheet":
+                    tbl = build_simfin_balance_table(_sf_bs)
+                    if tbl is not None:
+                        st.dataframe(tbl, use_container_width=True)
+                        if _sf_bs is not None and "Total Assets" in _sf_bs.columns:
+                            _bs_df = _sf_bs[["Fiscal Year", "Total Assets", "Total Liabilities", "Total Equity"]].dropna().copy()
+                            _bs_df = _bs_df.sort_values("Fiscal Year")
+                            for _c in ["Total Assets", "Total Liabilities", "Total Equity"]:
+                                _bs_df[_c] = pd.to_numeric(_bs_df[_c], errors="coerce") / 1e9
+                            _fig_bs = px.bar(
+                                _bs_df, x="Fiscal Year",
+                                y=["Total Assets", "Total Liabilities", "Total Equity"],
+                                barmode="group",
+                                title=f"{val_ticker} — Balance Sheet (Billions $)",
+                            )
+                            _fig_bs.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+                            _fig_bs.update_xaxes(showgrid=False)
+                            _fig_bs.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)", title="$B")
+                            st.plotly_chart(_fig_bs, use_container_width=True)
+                    else:
+                        st.info("Balance sheet data not available.")
+
+                else:  # Cash Flow
+                    tbl = build_simfin_cashflow_table(_sf_cf)
+                    if tbl is not None:
+                        st.dataframe(tbl, use_container_width=True)
+                        if _sf_cf is not None and "Net Cash from Operating Activities" in _sf_cf.columns:
+                            _cf_df = _sf_cf[["Fiscal Year", "Net Cash from Operating Activities", "Capital Expenditures"]].dropna().copy()
+                            _cf_df = _cf_df.sort_values("Fiscal Year")
+                            _cf_df["Free Cash Flow"] = (
+                                pd.to_numeric(_cf_df["Net Cash from Operating Activities"], errors="coerce") +
+                                pd.to_numeric(_cf_df["Capital Expenditures"], errors="coerce")
+                            )
+                            for _c in ["Net Cash from Operating Activities", "Capital Expenditures", "Free Cash Flow"]:
+                                _cf_df[_c] = pd.to_numeric(_cf_df[_c], errors="coerce") / 1e9
+                            _fig_cf = px.bar(
+                                _cf_df, x="Fiscal Year",
+                                y=["Net Cash from Operating Activities", "Free Cash Flow"],
+                                barmode="group",
+                                title=f"{val_ticker} — Cash Flow (Billions $)",
+                            )
+                            _fig_cf.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+                            _fig_cf.update_xaxes(showgrid=False)
+                            _fig_cf.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)", title="$B")
+                            st.plotly_chart(_fig_cf, use_container_width=True)
+                    else:
+                        st.info("Cash flow data not available.")
+
+                st.caption("Data sourced from [SimFin](https://simfin.com) · Standardised GAAP financials")
+
+    # ------------------------------------------------------------------
+    # TECHNICAL SIGNALS — Alpha Vantage
+    # ------------------------------------------------------------------
+    with _val_tech:
+        if not has_alpha_vantage():
+            st.warning("🔑 Alpha Vantage API key not configured.")
+            st.info(
+                "Get a **free** key (25 calls/day) at "
+                "[alphavantage.co](https://www.alphavantage.co/support/#api-key) "
+                "then add `ALPHA_VANTAGE_KEY=your_key` to `.env` and restart.\n\n"
+                "Provides RSI, MACD, and Bollinger Bands — cached 24 hrs to stay within quota."
+            )
+        elif val_ticker:
+            st.caption(
+                f"Technical indicators for **{val_ticker}** · "
+                "Alpha Vantage free tier (25 calls/day — cached 24 hrs)."
+            )
+            with st.spinner(f"Fetching technical indicators for {val_ticker}..."):
+                _av = fetch_av_indicators(val_ticker)
+            _av_latest = _av.get("latest", {})
+
+            if not _av_latest:
+                st.warning(
+                    "No indicator data returned. Alpha Vantage may have hit the "
+                    "25-call daily limit, or the ticker is unrecognised."
+                )
+            else:
+                _av1, _av2, _av3, _av4, _av5 = st.columns(5)
+                _rsi_val = _av_latest.get("rsi")
+                _av1.metric("RSI (14)", f"{_rsi_val}" if _rsi_val else "—",
+                            help="<30 oversold · >70 overbought")
+                _av2.metric("MACD", f"{_av_latest.get('macd', '—')}")
+                _av3.metric("MACD Signal", f"{_av_latest.get('macd_signal', '—')}")
+                _av4.metric("BB Upper", f"${_av_latest.get('bb_upper', '—')}")
+                _av5.metric("BB Lower", f"${_av_latest.get('bb_lower', '—')}")
+                st.divider()
+
+                _tech_view = st.radio(
+                    "Chart", ["RSI", "MACD", "Bollinger Bands"],
+                    horizontal=True, key="av_chart_radio",
+                )
+                if _tech_view == "RSI":
+                    _rsi_df = _av.get("rsi")
+                    if _rsi_df is not None and not _rsi_df.empty:
+                        _fig_rsi = px.line(_rsi_df, y="RSI",
+                                           title=f"{val_ticker} — RSI (14)")
+                        _fig_rsi.add_hline(y=70, line_dash="dot", line_color="#e74c3c",
+                                           annotation_text="Overbought (70)")
+                        _fig_rsi.add_hline(y=30, line_dash="dot", line_color="#27ae60",
+                                           annotation_text="Oversold (30)")
+                        _fig_rsi.update_layout(plot_bgcolor="rgba(0,0,0,0)",
+                                               paper_bgcolor="rgba(0,0,0,0)",
+                                               yaxis_range=[0, 100])
+                        _fig_rsi.update_xaxes(showgrid=False)
+                        st.plotly_chart(_fig_rsi, use_container_width=True)
+
+                elif _tech_view == "MACD":
+                    _macd_df = _av.get("macd")
+                    if _macd_df is not None and not _macd_df.empty:
+                        _fig_macd = px.line(_macd_df, y=["MACD", "Signal"],
+                                            title=f"{val_ticker} — MACD (12, 26, 9)")
+                        _fig_macd.add_bar(x=_macd_df.index, y=_macd_df["Histogram"],
+                                          name="Histogram", opacity=0.4)
+                        _fig_macd.update_layout(plot_bgcolor="rgba(0,0,0,0)",
+                                                paper_bgcolor="rgba(0,0,0,0)")
+                        _fig_macd.update_xaxes(showgrid=False)
+                        st.plotly_chart(_fig_macd, use_container_width=True)
+
+                else:
+                    _bb_df = _av.get("bbands")
+                    if _bb_df is not None and not _bb_df.empty:
+                        _fig_bb = px.line(_bb_df, y=["Upper", "Middle", "Lower"],
+                                          title=f"{val_ticker} — Bollinger Bands (20, 2σ)",
+                                          color_discrete_map={
+                                              "Upper": "#e74c3c",
+                                              "Middle": "#3498db",
+                                              "Lower": "#27ae60",
+                                          })
+                        _fig_bb.update_layout(plot_bgcolor="rgba(0,0,0,0)",
+                                              paper_bgcolor="rgba(0,0,0,0)")
+                        _fig_bb.update_xaxes(showgrid=False)
+                        st.plotly_chart(_fig_bb, use_container_width=True)
 
 # ===========================
 # TAB 4: MARKET INTELLIGENCE (AI POWERED)
 # ===========================
-with tab4:
+if _active == "📰 Intelligence":
     st.header("Market Intelligence")
     st.markdown("Live, unfiltered news feeds analyzed entirely offline by Llama 3.2.")
     
@@ -2001,11 +2668,11 @@ with tab4:
 1. The Logic-First Filter: Perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions.
 2. Probabilistic Calibration: Reject binary True/False. Treat new info as Evidence updating a Prior Belief."""
 
-                            response = ollama.chat(model='llama3.2', messages=[
+                            from llm_router import llm_chat as _llm_chat
+                            ai_analysis = _llm_chat([
                                 {'role': 'system', 'content': oracle_persona},
                                 {'role': 'user', 'content': ai_prompt}
-                            ])
-                            ai_analysis = response['message']['content'].strip()
+                            ]).strip()
                             
                             if "BULLISH" in ai_analysis.upper(): st.success(f"**AI Sentiment:** {ai_analysis}")
                             elif "BEARISH" in ai_analysis.upper(): st.error(f"**AI Sentiment:** {ai_analysis}")
@@ -2017,7 +2684,7 @@ with tab4:
 # ===========================
 # TAB 5: PEER MATRIX
 # ===========================
-with tab5:
+if _active == "🏢 Peer Matrix":
     st.header("Peer Group Comparison Matrix")
     st.markdown("Compare relative valuation multiples across custom industry cohorts.")
 
@@ -2101,65 +2768,872 @@ with tab5:
         else: st.info("This cohort is empty. Add some tickers above.")
 
 # ===========================
-# TAB 6: MACROECONOMICS (FRED)
+# TAB 6: MACROECONOMICS
 # ===========================
-with tab6:
-    st.header("Macroeconomic Indicators (FRED)")
-    st.markdown("Analyze top-down systemic risks using direct data feeds from the Federal Reserve.")
+if _active == "🌐 Global Markets":
+    st.header("🌐 Global Markets")
+    st.caption("Macro, energy, commodities, crypto, and analyst intelligence — all in one place.")
 
-    if not fred:
-        st.error("🚨 **System Lock:** FRED API key not detected.")
-        st.info("To unlock this module, add `FRED_API_KEY=your_key` to your `.env` file and restart the application.")
-    else:
-        st.subheader("Data Selection")
-        standard_indicators = {
-            "Effective Federal Funds Rate (Interest Rates)": "FEDFUNDS",
-            "Consumer Price Index (Inflation)": "CPIAUCSL",
-            "Real Gross Domestic Product (GDP)": "GDPC1",
-            "M2 Money Supply (Liquidity)": "M2SL",
-            "Unemployment Rate": "UNRATE",
-            "10-Year Treasury Constant Maturity Rate": "DGS10",
-            "ICE BofA US High Yield Spread (Credit Risk)": "BAMLH0A0HYM2", 
-            "Federal Reserve Total Assets (System Liquidity)": "WALCL",
-            "Custom Series ID...": "CUSTOM"
-        }
-        
-        col_m_sel, col_m_cust = st.columns([2, 1])
-        with col_m_sel:
-            selected_indicator_name = st.selectbox("Select Institutional Metric", list(standard_indicators.keys()))
-            selected_series_id = standard_indicators[selected_indicator_name]
-            
-        with col_m_cust:
-            if selected_series_id == "CUSTOM":
-                selected_series_id = st.text_input("Enter FRED Series ID").upper()
+    _gm_systemic, _gm_resources, _gm_fmp = st.tabs([
+        "🏛️ US Systemic Data",
+        "⚡ Resources & Assets",
+        "📈 FMP Analytics",
+    ])
+
+    # ==============================================================
+    # SUBTAB 1: US SYSTEMIC DATA (FRED / BLS / BEA / Treasury)
+    # ==============================================================
+    with _gm_systemic:
+        st.caption("Official U.S. macro data: Federal Reserve, BLS, BEA, and Treasury.")
+        _mac_fred, _mac_bls, _mac_bea, _mac_tsy = st.tabs([
+            "🏛️ FRED Explorer",
+            "👷 Labor & Inflation (BLS)",
+            "📊 GDP & Spending (BEA)",
+            "🏦 Treasury & Debt",
+        ])
+
+    # ------------------------------------------------------------------
+    # FRED EXPLORER (existing)
+    # ------------------------------------------------------------------
+    with _mac_fred:
+        if not fred:
+            st.error("🚨 FRED API key not detected.")
+            st.info("Add `FRED_API_KEY=your_key` to `.env` and restart.")
+        else:
+            standard_indicators = {
+                "Effective Federal Funds Rate (Interest Rates)": "FEDFUNDS",
+                "Consumer Price Index (Inflation)": "CPIAUCSL",
+                "Real Gross Domestic Product (GDP)": "GDPC1",
+                "M2 Money Supply (Liquidity)": "M2SL",
+                "Unemployment Rate": "UNRATE",
+                "10-Year Treasury Constant Maturity Rate": "DGS10",
+                "ICE BofA US High Yield Spread (Credit Risk)": "BAMLH0A0HYM2",
+                "Federal Reserve Total Assets (System Liquidity)": "WALCL",
+                "Custom Series ID...": "CUSTOM",
+            }
+            col_m_sel, col_m_cust = st.columns([2, 1])
+            with col_m_sel:
+                selected_indicator_name = st.selectbox(
+                    "Select Institutional Metric", list(standard_indicators.keys())
+                )
+                selected_series_id = standard_indicators[selected_indicator_name]
+            with col_m_cust:
+                if selected_series_id == "CUSTOM":
+                    selected_series_id = st.text_input("Enter FRED Series ID").upper()
+                else:
+                    st.text_input("Active Series ID", value=selected_series_id, disabled=True)
+            st.divider()
+            if selected_series_id and selected_series_id != "CUSTOM":
+                with st.spinner(f"Querying FRED for {selected_series_id}..."):
+                    macro_df = fetch_macro_data(selected_series_id)
+                if macro_df is not None and not macro_df.empty:
+                    latest_date  = macro_df.index[-1].strftime("%B %Y")
+                    latest_value = macro_df["Value"].iloc[-1]
+                    st.metric(f"Latest Print ({latest_date})", f"{latest_value:,.2f}")
+                    fig_macro = px.area(
+                        macro_df, x=macro_df.index, y="Value",
+                        title=f"{selected_indicator_name} (Last 20 Years)",
+                    )
+                    fig_macro.update_layout(
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        hovermode="x unified",
+                    )
+                    fig_macro.update_xaxes(showgrid=False, title_text="")
+                    fig_macro.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                    fig_macro.update_traces(
+                        line_color="#2980b9", fillcolor="rgba(41,128,185,0.2)"
+                    )
+                    st.plotly_chart(fig_macro, use_container_width=True)
+                else:
+                    st.warning(f"No data for {selected_series_id}. Verify the series ID.")
+
+    # ------------------------------------------------------------------
+    # BLS — LABOR & INFLATION
+    # ------------------------------------------------------------------
+    with _mac_bls:
+        st.subheader("Bureau of Labor Statistics")
+        st.caption(
+            "Official U.S. labor market and inflation data — CPI, Core CPI, PPI, "
+            "Nonfarm Payrolls, and Unemployment. "
+            "No API key required · add `BLS_API_KEY` to `.env` for 20-year history."
+        )
+        with st.spinner("Fetching BLS indicators..."):
+            _bls = fetch_bls_indicators()
+
+        _bls_latest = _bls.get("latest", {})
+        _bls_series = _bls.get("series", {})
+
+        if not _bls_latest:
+            st.warning(
+                "BLS data unavailable — the BLS public API may be rate-limited. "
+                "Try again in a few minutes."
+            )
+        else:
+            # ---- Scorecard row ----
+            _b1, _b2, _b3, _b4, _b5 = st.columns(5)
+            _b1.metric(
+                "🧾 CPI (YoY)",
+                f"{_bls_latest.get('cpi_yoy', 'N/A')}%",
+                help=f"All-items CPI as of {_bls_latest.get('cpi_date', '')}",
+            )
+            _b2.metric(
+                "🔍 Core CPI (YoY)",
+                f"{_bls_latest.get('core_cpi_yoy', 'N/A')}%",
+                help="Ex food & energy",
+            )
+            _b3.metric(
+                "🏭 PPI (YoY)",
+                f"{_bls_latest.get('ppi_yoy', 'N/A')}%",
+                help=f"Producer Price Index as of {_bls_latest.get('ppi_date', '')}",
+            )
+            _b4.metric(
+                "👷 Payrolls (MoM)",
+                f"{_bls_latest.get('payrolls_mom', 'N/A'):,}K"
+                if isinstance(_bls_latest.get("payrolls_mom"), (int, float)) else "N/A",
+                help=f"Nonfarm payrolls change as of {_bls_latest.get('payrolls_date', '')}",
+            )
+            _b5.metric(
+                "📉 Unemployment",
+                f"{_bls_latest.get('unemployment', 'N/A')}%",
+                help=f"As of {_bls_latest.get('unemployment_date', '')}",
+            )
+            st.divider()
+
+            # ---- Chart selector ----
+            _bls_chart_opts = {
+                "CPI (All Items)":        ("cpi",          "CPI Index Level"),
+                "Core CPI (ex F&E)":      ("core_cpi",     "Core CPI Index Level"),
+                "PPI (Final Demand)":     ("ppi",          "PPI Index Level"),
+                "Nonfarm Payrolls":       ("payrolls",     "Thousands of Jobs"),
+                "Unemployment Rate (%)":  ("unemployment", "Unemployment %"),
+            }
+            _bls_choice = st.selectbox(
+                "Chart series", list(_bls_chart_opts.keys()), key="bls_chart_sel"
+            )
+            _bls_key, _bls_ylabel = _bls_chart_opts[_bls_choice]
+            _bls_df = _bls_series.get(_bls_key)
+            if _bls_df is not None and not _bls_df.empty:
+                _fig_bls = px.area(
+                    _bls_df, x=_bls_df.index, y="Value",
+                    title=f"{_bls_choice} — BLS Official Data",
+                    labels={"Value": _bls_ylabel},
+                )
+                _fig_bls.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    hovermode="x unified",
+                )
+                _fig_bls.update_xaxes(showgrid=False, title_text="")
+                _fig_bls.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                _fig_bls.update_traces(
+                    line_color="#e67e22", fillcolor="rgba(230,126,34,0.15)"
+                )
+                st.plotly_chart(_fig_bls, use_container_width=True)
             else:
-                st.text_input("Active Series ID", value=selected_series_id, disabled=True)
+                st.info("Series data not yet available.")
+
+    # ------------------------------------------------------------------
+    # BEA — GDP & SPENDING
+    # ------------------------------------------------------------------
+    with _mac_bea:
+        st.subheader("Bureau of Economic Analysis")
+        if not has_bea():
+            st.warning("🔑 BEA API key not configured.")
+            st.info(
+                "Get a free key at **[apps.bea.gov/API/signup](https://apps.bea.gov/API/signup/)** "
+                "then add `BEA_API_KEY=your_key` to `.env` and restart."
+            )
+        else:
+            st.caption(
+                "GDP growth and PCE inflation — the two data series the Fed watches most closely."
+            )
+            _bea_col1, _bea_col2 = st.columns(2)
+
+            with st.spinner("Fetching BEA data..."):
+                _gdp  = fetch_bea_gdp()
+                _pce  = fetch_bea_pce()
+
+            # GDP metric + chart
+            with _bea_col1:
+                st.markdown("#### 📈 Real GDP Growth (QoQ, annualized %)")
+                if _gdp:
+                    _gdp_delta_color = "normal" if _gdp["latest"] >= 0 else "inverse"
+                    st.metric(
+                        f"Latest ({_gdp['latest_date']})",
+                        f"{_gdp['latest']:+.2f}%",
+                    )
+                    _fig_gdp = px.bar(
+                        _gdp["series"].reset_index(),
+                        x="Date", y="Value",
+                        title="Real GDP Growth Rate",
+                        labels={"Value": "% Change (annualized)"},
+                        color="Value",
+                        color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"],
+                    )
+                    _fig_gdp.update_layout(
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        coloraxis_showscale=False,
+                    )
+                    _fig_gdp.update_xaxes(showgrid=False)
+                    _fig_gdp.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                    st.plotly_chart(_fig_gdp, use_container_width=True)
+                else:
+                    st.info("GDP data unavailable.")
+
+            # PCE metric + chart
+            with _bea_col2:
+                st.markdown("#### 💸 PCE Price Index (YoY % — Fed target: 2%)")
+                if _pce:
+                    _pce_yoy = _pce.get("latest_yoy")
+                    st.metric(
+                        f"Latest ({_pce['latest_date']})",
+                        f"{_pce_yoy:+.2f}%" if _pce_yoy is not None else "N/A",
+                        help="Fed's preferred inflation gauge (vs. 2% target)",
+                    )
+                    _fig_pce = px.area(
+                        _pce["series"].reset_index(),
+                        x="Date", y="Value",
+                        title="PCE Price Index",
+                        labels={"Value": "Index Level"},
+                    )
+                    _fig_pce.update_layout(
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                    )
+                    _fig_pce.update_xaxes(showgrid=False)
+                    _fig_pce.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                    _fig_pce.update_traces(
+                        line_color="#8e44ad", fillcolor="rgba(142,68,173,0.15)"
+                    )
+                    st.plotly_chart(_fig_pce, use_container_width=True)
+                else:
+                    st.info("PCE data unavailable.")
+
+    # ------------------------------------------------------------------
+    # TREASURY & DEBT
+    # ------------------------------------------------------------------
+    with _mac_tsy:
+        st.subheader("U.S. Treasury — Fiscal Data")
+        st.caption("National debt and yield curve sourced directly from Treasury APIs. No API key required.")
+
+        _tsy_col1, _tsy_col2 = st.columns([1, 2])
+
+        with st.spinner("Fetching Treasury data..."):
+            _debt = fetch_treasury_debt()
+            _yc   = fetch_yield_curve()
+
+        # National Debt
+        with _tsy_col1:
+            st.markdown("#### 🏛️ National Debt")
+            if _debt:
+                st.metric(
+                    f"Total Outstanding ({_debt['latest_date']})",
+                    f"${_debt['latest_trillions']:,.2f}T",
+                )
+                _debt_series = _debt.get("series")
+                if _debt_series is not None and not _debt_series.empty:
+                    _fig_debt = px.area(
+                        _debt_series.reset_index(),
+                        x="Date", y="Value",
+                        title="National Debt (Trillions USD)",
+                        labels={"Value": "Trillions ($)"},
+                    )
+                    _fig_debt.update_layout(
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                    )
+                    _fig_debt.update_xaxes(showgrid=False)
+                    _fig_debt.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                    _fig_debt.update_traces(
+                        line_color="#c0392b", fillcolor="rgba(192,57,43,0.15)"
+                    )
+                    st.plotly_chart(_fig_debt, use_container_width=True)
+            else:
+                st.info("Debt data unavailable.")
+
+        # Yield Curve
+        with _tsy_col2:
+            st.markdown("#### 📐 Treasury Yield Curve")
+            if _yc is not None and not _yc.empty:
+                _spread_10_2 = None
+                _y10 = _yc.loc[_yc["Maturity"] == "10Y", "Yield"]
+                _y2  = _yc.loc[_yc["Maturity"] == "2Y",  "Yield"]
+                if not _y10.empty and not _y2.empty:
+                    _spread_10_2 = round(float(_y10.iloc[0]) - float(_y2.iloc[0]), 3)
+
+                _yc_cols = st.columns(3)
+                for _i, row in _yc.iterrows():
+                    _yc_cols[_i % 3].metric(row["Maturity"], f"{row['Yield']:.3f}%")
+
+                st.divider()
+                if _spread_10_2 is not None:
+                    _inv = "🔴 Inverted" if _spread_10_2 < 0 else "🟢 Normal"
+                    st.metric(
+                        "10Y–2Y Spread (Inversion Indicator)",
+                        f"{_spread_10_2:+.3f}%",
+                        help=f"{_inv} curve  · Negative = recession signal",
+                    )
+
+                _fig_yc = px.line(
+                    _yc, x="Maturity", y="Yield",
+                    title="Treasury Yield Curve (today)",
+                    labels={"Yield": "Yield (%)"},
+                    markers=True,
+                )
+                _fig_yc.update_layout(
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                _fig_yc.update_xaxes(showgrid=False)
+                _fig_yc.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                _fig_yc.update_traces(line_color="#16a085", marker_color="#16a085")
+                st.plotly_chart(_fig_yc, use_container_width=True)
+
+                if not fred:
+                    st.caption(
+                        "_Sourced from Treasury.gov XML. Add `FRED_API_KEY` to `.env` "
+                        "for higher-reliability FRED-backed yield data._"
+                    )
+            else:
+                st.info(
+                    "Yield curve data unavailable. "
+                    "Add `FRED_API_KEY` to `.env` for the most reliable source."
+                )
+
+    # ==============================================================
+    # SUBTAB 2: RESOURCES & ASSETS
+    # ==============================================================
+    with _gm_resources:
+        st.caption("Energy inventories (EIA), commodities, crypto market, and sentiment.")
+
+        # ---- CNN Fear & Greed ----
+        with st.spinner("Loading sentiment data..."):
+            _fg = fetch_fear_greed()
+        if _fg and _fg.get("score") is not None:
+            _fg_score  = _fg["score"]
+            _fg_rating = _fg.get("rating", "")
+            _fg_color  = ("#e74c3c" if _fg_score < 25 else
+                          "#e67e22" if _fg_score < 45 else
+                          "#f1c40f" if _fg_score < 55 else
+                          "#2ecc71" if _fg_score < 75 else "#27ae60")
+            _fgc1, _fgc2 = st.columns([1, 3])
+            with _fgc1:
+                st.markdown(f"""
+                <div style='text-align:center; padding:16px; border-radius:12px;
+                            background:{_fg_color}22; border:2px solid {_fg_color}'>
+                  <div style='font-size:2.8rem; font-weight:700; color:{_fg_color}'>{int(_fg_score)}</div>
+                  <div style='font-size:1rem; font-weight:600; color:{_fg_color}'>{_fg_rating}</div>
+                  <div style='font-size:0.75rem; color:#888'>CNN Fear & Greed</div>
+                </div>""", unsafe_allow_html=True)
+            with _fgc2:
+                if _fg.get("history") is not None:
+                    _fig_fg = px.area(_fg["history"], y="Score",
+                                      title="Fear & Greed — 1 Year History",
+                                      color_discrete_sequence=[_fg_color])
+                    _fig_fg.add_hline(y=25, line_dash="dot", line_color="#e74c3c",
+                                      annotation_text="Extreme Fear")
+                    _fig_fg.add_hline(y=75, line_dash="dot", line_color="#27ae60",
+                                      annotation_text="Extreme Greed")
+                    _fig_fg.update_layout(plot_bgcolor="rgba(0,0,0,0)",
+                                          paper_bgcolor="rgba(0,0,0,0)",
+                                          yaxis_range=[0, 100])
+                    _fig_fg.update_xaxes(showgrid=False)
+                    st.plotly_chart(_fig_fg, use_container_width=True)
+        else:
+            st.info("Fear & Greed data unavailable.")
+        st.divider()
+
+        # ---- Commodities + Crypto side by side ----
+        _rc1, _rc2 = st.columns(2)
+
+        with _rc1:
+            st.markdown("#### 🏅 Commodities")
+            with st.spinner("Loading commodity prices..."):
+                _comms = fetch_commodity_prices()
+            for _cname, _cdata in _comms.items():
+                _cp = _cdata.get("price")
+                _cc = _cdata.get("change")
+                if _cp is not None:
+                    _delta_color = "normal" if (_cc or 0) >= 0 else "inverse"
+                    st.metric(_cname, f"${_cp:,.2f}",
+                              delta=f"{_cc:+.2f}%" if _cc is not None else None,
+                              delta_color=_delta_color)
+                else:
+                    st.metric(_cname, "—")
+
+        with _rc2:
+            st.markdown("#### ₿ Crypto Market")
+            with st.spinner("Loading CoinGecko data..."):
+                _cg_global = fetch_coingecko_global()
+                _cg_top    = fetch_coingecko_top_coins(10)
+            if _cg_global:
+                _cgg1, _cgg2, _cgg3 = st.columns(3)
+                _tmc = _cg_global.get("total_market_cap_usd")
+                _btcd = _cg_global.get("btc_dominance")
+                _mcc  = _cg_global.get("market_cap_change_24h")
+                _cgg1.metric("Total Mkt Cap",
+                             f"${_tmc/1e12:.2f}T" if _tmc else "—",
+                             delta=f"{_mcc:+.1f}%" if _mcc else None)
+                _cgg2.metric("BTC Dominance",
+                             f"{_btcd:.1f}%" if _btcd else "—")
+                _cgg3.metric("ETH Dominance",
+                             f"{_cg_global.get('eth_dominance', 0):.1f}%")
+            if _cg_top is not None:
+                st.dataframe(
+                    _cg_top,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Price":    st.column_config.NumberColumn(format="$%.4f"),
+                        "24h %":    st.column_config.NumberColumn(format="%.2f%%"),
+                        "7d %":     st.column_config.NumberColumn(format="%.2f%%"),
+                        "Mkt Cap":  st.column_config.NumberColumn(format="$%.0f"),
+                        "Vol 24h":  st.column_config.NumberColumn(format="$%.0f"),
+                    },
+                )
+            else:
+                st.info("CoinGecko data unavailable (rate limit — try again shortly).")
 
         st.divider()
 
-        if selected_series_id and selected_series_id != "CUSTOM":
-            with st.spinner(f"Querying Federal Reserve database for {selected_series_id}..."):
-                macro_df = fetch_macro_data(selected_series_id)
-                if macro_df is not None and not macro_df.empty:
-                    latest_date = macro_df.index[-1].strftime('%B %Y')
-                    latest_value = macro_df['Value'].iloc[-1]
-                    st.metric(f"Latest Print ({latest_date})", f"{latest_value:,.2f}")
-                    
-                    fig_macro = px.area(macro_df, x=macro_df.index, y='Value', title=f"{selected_indicator_name} (Last 20 Years)")
-                    fig_macro.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", hovermode="x unified")
-                    fig_macro.update_xaxes(showgrid=False, title_text="")
-                    fig_macro.update_yaxes(showgrid=True, gridcolor='rgba(128,128,128,0.2)')
-                    fig_macro.update_traces(line_color='#2980b9', fillcolor='rgba(41, 128, 185, 0.2)')
-                    st.plotly_chart(fig_macro, use_container_width=True)
-                else:
-                    st.warning(f"Could not retrieve data for Series ID: {selected_series_id}. Please verify the ID is correct.")
+        # ---- EIA Energy ----
+        st.markdown("#### ⚡ EIA Energy Inventories")
+        if not has_eia():
+            st.info("Add `EIA_API_KEY=...` to `.env` for weekly energy inventory data.\n\n"
+                    "Free key at [eia.gov/opendata](https://www.eia.gov/opendata/register.php).")
+        else:
+            with st.spinner("Fetching EIA energy data..."):
+                _eia = fetch_eia_snapshot()
+            _eia_latest = _eia.get("latest", {})
+            _eia_series = _eia.get("series", {})
+            if not _eia_latest:
+                st.warning("EIA data unavailable — check your API key or try again.")
+            else:
+                _eia_cols = st.columns(len(_eia_latest))
+                for _i, (_key, _info) in enumerate(_eia_latest.items()):
+                    _wow = _info.get("wow_change")
+                    _eia_cols[_i].metric(
+                        f"{_info['label']} ({_info['unit']})",
+                        f"{_info['value']:,.1f}",
+                        delta=f"{_wow:+.1f} WoW" if _wow is not None else None,
+                        help=f"As of {_info['date']}",
+                    )
+                _eia_choice = st.selectbox(
+                    "Chart EIA series", list(_eia_latest.keys()),
+                    format_func=lambda k: _eia_latest[k]["label"],
+                    key="eia_chart_sel",
+                )
+                _eia_df = _eia_series.get(_eia_choice)
+                if _eia_df is not None and not _eia_df.empty:
+                    _unit = _eia_latest[_eia_choice]["unit"]
+                    _fig_eia = px.area(_eia_df, y="Value",
+                                       title=f"{_eia_latest[_eia_choice]['label']} ({_unit})")
+                    _fig_eia.update_layout(plot_bgcolor="rgba(0,0,0,0)",
+                                           paper_bgcolor="rgba(0,0,0,0)")
+                    _fig_eia.update_xaxes(showgrid=False)
+                    _fig_eia.update_traces(line_color="#f39c12",
+                                           fillcolor="rgba(243,156,18,0.15)")
+                    st.plotly_chart(_fig_eia, use_container_width=True)
+
+        st.divider()
+
+        # ---- CFTC Commitment of Traders ----
+        st.markdown("#### 📊 CFTC Commitments of Traders")
+        st.caption(
+            "Weekly speculator (non-commercial) positioning in key futures markets. "
+            "No API key required — public CFTC data, updated every Friday."
+        )
+        with st.spinner("Fetching CFTC CoT data..."):
+            _cftc_snap = fetch_cftc_snapshot()
+
+        if not _cftc_snap:
+            st.info(
+                "CFTC CoT data unavailable right now — "
+                "the CFTC Socrata API may be temporarily slow. Try again shortly."
+            )
+        else:
+            # --- Snapshot table ---
+            _cftc_rows = []
+            for _ck, _cv in _cftc_snap.items():
+                _nc_net = _cv["nc_net"]
+                _nc_chg = _cv["nc_chg"]
+                _bias = ("🐂 Bullish" if _nc_net > 50_000 else
+                         "🐻 Bearish" if _nc_net < -50_000 else
+                         "🐂 Mild Bull" if _nc_net > 0 else "🐻 Mild Bear")
+                _cftc_rows.append({
+                    "Market":          _cv["label"],
+                    "Net Speculative": _nc_net,
+                    "WoW Change":      _nc_chg,
+                    "Bias":            _bias,
+                    "Open Interest":   _cv["oi"],
+                    "As of":           _cv["date"],
+                })
+            _cftc_df_table = pd.DataFrame(_cftc_rows)
+            st.dataframe(
+                _cftc_df_table,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Net Speculative": st.column_config.NumberColumn(format="%d"),
+                    "WoW Change":      st.column_config.NumberColumn(format="%+d"),
+                    "Open Interest":   st.column_config.NumberColumn(format="%d"),
+                },
+            )
+
+            # --- Historical net positioning chart ---
+            _cftc_mkt_opts = list(_cftc_snap.keys())
+            _cftc_sel = st.selectbox(
+                "Chart speculator net positioning",
+                _cftc_mkt_opts,
+                format_func=lambda k: _cftc_snap.get(k, {}).get("label", k),
+                key="cftc_chart_sel",
+            )
+            with st.spinner(f"Loading {_cftc_snap[_cftc_sel]['label']} history..."):
+                _cftc_hist = fetch_cftc_cot(_cftc_sel, weeks=104)  # ~2 years
+
+            if _cftc_hist is not None and not _cftc_hist.empty:
+                _cftc_mkt_label = _cftc_snap[_cftc_sel]["label"]
+                _net_vals = _cftc_hist["NonComm_Net"]
+                _bar_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in _net_vals]
+                _fig_cftc = go.Figure()
+                _fig_cftc.add_trace(go.Bar(
+                    x=_cftc_hist.index,
+                    y=_net_vals,
+                    name="Net Speculative",
+                    marker_color=_bar_colors,
+                    hovertemplate="%{x|%b %d %Y}<br>Net: %{y:,d}<extra></extra>",
+                ))
+                _fig_cftc.add_hline(y=0, line_color="#888", line_width=1)
+                _fig_cftc.update_layout(
+                    title=f"{_cftc_mkt_label} — Speculator Net Positions (2-Year)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    yaxis_title="Contracts (Long − Short)",
+                    showlegend=False,
+                    bargap=0.1,
+                )
+                _fig_cftc.update_xaxes(showgrid=False)
+                _fig_cftc.update_yaxes(zeroline=True, zerolinecolor="#555",
+                                        zerolinewidth=1)
+                st.plotly_chart(_fig_cftc, use_container_width=True)
+                st.caption(
+                    "**Reading the chart:** Green bars = speculators are net long "
+                    "(bullish). Red bars = net short (bearish). Extreme readings "
+                    "near historical highs/lows often act as contrarian signals."
+                )
+
+    # ==============================================================
+    # SUBTAB 3: FMP ANALYTICS
+    # ==============================================================
+    with _gm_fmp:
+        if not has_fmp():
+            st.warning("🔑 FMP API key not configured.")
+            st.info(
+                "Get a **free** key (250 calls/day) at "
+                "[financialmodelingprep.com](https://financialmodelingprep.com/developer/docs) "
+                "then add `FMP_API_KEY=your_key` to `.env` and restart.\n\n"
+                "Unlocks: analyst price targets, forward EPS estimates, "
+                "company profiles, and quantitative ratings."
+            )
+        else:
+            _fmp_ticker = st.text_input("Ticker", value="AAPL",
+                                        key="fmp_ticker").upper().strip()
+            if _fmp_ticker:
+                with st.spinner(f"Fetching FMP data for {_fmp_ticker}..."):
+                    _fmp_profile   = fetch_fmp_profile(_fmp_ticker)
+                    _fmp_targets   = fetch_fmp_price_targets(_fmp_ticker)
+                    _fmp_estimates = fetch_fmp_analyst_estimates(_fmp_ticker)
+                    _fmp_rating    = fetch_fmp_ratings(_fmp_ticker)
+
+                # ---- Company Profile ----
+                if _fmp_profile:
+                    _fp1, _fp2 = st.columns([3, 1])
+                    with _fp1:
+                        st.markdown(f"#### {_fmp_profile.get('companyName', _fmp_ticker)}")
+                        st.caption(
+                            f"**Sector:** {_fmp_profile.get('sector','—')}  ·  "
+                            f"**Industry:** {_fmp_profile.get('industry','—')}  ·  "
+                            f"**CEO:** {_fmp_profile.get('ceo','—')}  ·  "
+                            f"**Employees:** {_fmp_profile.get('fullTimeEmployees','—'):,}"
+                            if isinstance(_fmp_profile.get('fullTimeEmployees'), int) else
+                            f"**Sector:** {_fmp_profile.get('sector','—')}  ·  "
+                            f"**Industry:** {_fmp_profile.get('industry','—')}"
+                        )
+                        with st.expander("Company Description"):
+                            st.write(_fmp_profile.get("description", "N/A"))
+                    with _fp2:
+                        _fmp_price = _fmp_profile.get("price")
+                        _fmp_mktcap = _fmp_profile.get("mktCap")
+                        if _fmp_price:
+                            st.metric("Price", f"${_fmp_price:,.2f}")
+                        if _fmp_mktcap:
+                            from api import _fmt_millions
+                            st.metric("Market Cap", _fmt_millions(_fmp_mktcap))
+                    st.divider()
+
+                # ---- Price Targets ----
+                if _fmp_targets:
+                    st.markdown("#### 🎯 Analyst Price Targets")
+                    _pt_cols = st.columns(4)
+                    _pt_cols[0].metric("Consensus",
+                                       f"${_fmp_targets.get('targetConsensus','—')}")
+                    _pt_cols[1].metric("High Target",
+                                       f"${_fmp_targets.get('targetHigh','—')}")
+                    _pt_cols[2].metric("Low Target",
+                                       f"${_fmp_targets.get('targetLow','—')}")
+                    _pt_cols[3].metric("Median Target",
+                                       f"${_fmp_targets.get('targetMedian','—')}")
+                    st.divider()
+
+                # ---- Quantitative Rating ----
+                if _fmp_rating:
+                    st.markdown("#### ⭐ FMP Quantitative Rating")
+                    _rat_cols = st.columns(4)
+                    _rat_cols[0].metric("Overall Rating", _fmp_rating.get("rating", "—"))
+                    _rat_cols[1].metric("DCF Score",
+                                        _fmp_rating.get("ratingDetailsDCFScore", "—"))
+                    _rat_cols[2].metric("ROE Score",
+                                        _fmp_rating.get("ratingDetailsROEScore", "—"))
+                    _rat_cols[3].metric("Recommendation",
+                                        _fmp_rating.get("ratingRecommendation", "—"))
+                    st.divider()
+
+                # ---- Forward Estimates ----
+                if _fmp_estimates is not None and not _fmp_estimates.empty:
+                    st.markdown("#### 📅 Forward Analyst Estimates")
+                    st.dataframe(
+                        _fmp_estimates,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Est. Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                            "Est. EPS":     st.column_config.NumberColumn(format="$%.2f"),
+                            "EPS Low":      st.column_config.NumberColumn(format="$%.2f"),
+                            "EPS High":     st.column_config.NumberColumn(format="$%.2f"),
+                        },
+                    )
+                elif _fmp_profile:
+                    st.info("No analyst estimates available for this ticker.")
 
 # ===========================
 # TAB 7: THE LIBRARY (RAG PIPELINE)
 # ===========================
-with tab7:
+if _active == "📚 The Library":
     st.header("The Library (Local RAG Database)")
     st.markdown("Inject financial PDFs, Annual 10-Ks, and Quarterly 8-K Earnings data directly into Noodle Bot's permanent memory.")
+
+    # -----------------------------------------------------------------------
+    # INSTITUTIONAL RESEARCH COVERAGE BOARD
+    # -----------------------------------------------------------------------
+    st.subheader("🏦 Institutional Research Coverage")
+    st.caption(
+        "Track which major institutions have a market report in the library. "
+        "🟢 = covered · ⚪ = missing. Each institution can have **multiple** "
+        "reports attached; the ⭐ marks the *primary* (default-displayed) one."
+    )
+
+    _inst_rows = list_institutional_coverage()
+    # Single full-library read for the whole Library tab — paginated pull through
+    # ChromaDB is now the single most expensive op on this tab (78 k+ chunks).
+    # Both the Institutional Coverage section *and* the Manage Library expander
+    # below need the same data, so we share it instead of re-querying.
+    _lib_docs = _list_documents()
+    # Only market_report docs are relevant for institutional coverage.
+    _mr_docs  = [d for d in _lib_docs if d["category"] == "market_report"]
+    _mr_by_id  = {d["doc_id"]: d for d in _mr_docs}
+    _doc_labels = {d["doc_id"]: d["source"] for d in _mr_docs}
+
+    # Per-row "update mode" toggle — lives in session_state so it survives reruns
+    if "_inst_update_mode" not in st.session_state:
+        st.session_state._inst_update_mode = set()
+
+    def _doc_label_short(doc_id: str) -> str:
+        """Compact label for a doc — strip the './temp_pdfs/' prefix and the
+        '.pdf' suffix so the row stays readable when many reports are stacked."""
+        raw = _doc_labels.get(doc_id, doc_id)
+        raw = raw.replace("./temp_pdfs/", "").replace("PDF: ", "")
+        if raw.lower().endswith(".pdf"):
+            raw = raw[:-4]
+        return raw
+
+    if not _inst_rows:
+        st.info("No institutions tracked yet — add one below.")
+    else:
+        # ---- Header row (bordered, like the mockup) ----
+        with st.container(border=True):
+            _hc1, _hc2, _hc3 = st.columns([2, 3, 2])
+            _hc1.markdown("**Institution**")
+            _hc2.markdown("**Attached Reports**")
+            _hc3.markdown("**Update Portal**")
+
+        # ---- Data rows ----
+        for _inst in _inst_rows:
+            _name        = _inst["institution"]
+            _primary_id  = _inst.get("primary_doc_id")
+            _doc_ids     = _inst.get("doc_ids") or []
+            _editing     = _name in st.session_state._inst_update_mode
+            _has_any     = bool(_doc_ids)
+
+            with st.container(border=True):
+                _ic1, _ic2, _ic3 = st.columns([2, 3, 2])
+                _ic1.markdown(f"{'🟢' if _has_any else '⚪'}  {_name}")
+
+                # ───────────────────────── EDIT MODE ─────────────────────────
+                if _editing:
+                    with _ic2:
+                        # Multi-file drop — accept many PDFs at once
+                        _new_pdfs = st.file_uploader(
+                            f"Drop new PDFs for {_name}",
+                            type="pdf",
+                            accept_multiple_files=True,
+                            key=f"inst_upload_{_name}",
+                            label_visibility="collapsed",
+                            help="Drag-and-drop one or many report PDFs here — each "
+                                 "is ingested as a market_report and attached to "
+                                 "this institution.",
+                        )
+                        # Pick existing reports already in the library
+                        _available_ids = [d["doc_id"] for d in _mr_docs
+                                          if d["doc_id"] not in _doc_ids]
+                        _sel_existing = st.multiselect(
+                            "Or pick from existing market reports",
+                            options=_available_ids,
+                            format_func=_doc_label_short,
+                            key=f"inst_link_{_name}",
+                            label_visibility="collapsed",
+                            placeholder="— pick existing report(s) to attach —",
+                        )
+
+                        # Already-attached reports list with primary toggle + unlink
+                        if _doc_ids:
+                            st.markdown("**Currently attached:**")
+                            for _doc_id in _doc_ids:
+                                _is_primary = _doc_id == _primary_id
+                                _l1, _l2, _l3 = st.columns([8, 1, 1])
+                                _star = "⭐ " if _is_primary else "☆ "
+                                _l1.markdown(
+                                    f"{_star}_{_doc_label_short(_doc_id)}_"
+                                )
+                                # Promote to primary
+                                if not _is_primary:
+                                    if _l2.button(
+                                        "⭐",
+                                        key=f"inst_setpri_{_name}_{_doc_id}",
+                                        help="Mark as primary",
+                                    ):
+                                        set_primary_institution_doc(_name, _doc_id)
+                                        st.rerun()
+                                else:
+                                    _l2.markdown("&nbsp;", unsafe_allow_html=True)
+                                # Unlink (does NOT delete the doc from the library)
+                                if _l3.button(
+                                    "✖",
+                                    key=f"inst_unlink_{_name}_{_doc_id}",
+                                    help="Detach from this institution",
+                                ):
+                                    unlink_institution_doc(_name, _doc_id)
+                                    st.rerun()
+
+                    with _ic3:
+                        _sb1, _sb2, _sb3 = st.columns(3)
+                        # ── Save: ingest dropped PDFs + attach selected existing
+                        if _sb1.button("💾", key=f"inst_save_{_name}", help="Save"):
+                            _added = 0
+                            _errors: list[str] = []
+                            # Path A: any newly-dropped PDFs → ingest then link
+                            for _pdf in (_new_pdfs or []):
+                                _safe_name  = os.path.basename(_pdf.name)
+                                _file_path  = os.path.join(UPLOAD_DIR, _safe_name)
+                                _new_doc_id = f"pdf::{_safe_name}"
+                                try:
+                                    with open(_file_path, "wb") as _f:
+                                        _f.write(_pdf.getbuffer())
+                                    if not _already_ingested(_new_doc_id):
+                                        with st.spinner(f"Ingesting {_safe_name}…"):
+                                            _loader   = PyMuPDFLoader(_file_path)
+                                            _pages    = _loader.load()
+                                            _splitter = RecursiveCharacterTextSplitter(
+                                                chunk_size=1000, chunk_overlap=200,
+                                            )
+                                            _doc_chunks = _splitter.split_documents(_pages)
+                                            _ingest_chunks(
+                                                _doc_chunks,
+                                                _new_doc_id,
+                                                f"PDF: {_safe_name}",
+                                                category="market_report",
+                                            )
+                                    link_institution_doc(_name, _new_doc_id)
+                                    _added += 1
+                                except Exception as _e:
+                                    _errors.append(f"{_safe_name}: {_e}")
+                            # Path B: existing reports the user picked
+                            for _doc_id in (_sel_existing or []):
+                                link_institution_doc(_name, _doc_id)
+                                _added += 1
+
+                            if _errors:
+                                for _err in _errors:
+                                    st.error(f"Failed: {_err}")
+                            if _added:
+                                st.session_state._inst_update_mode.discard(_name)
+                                st.toast(
+                                    f"📄 Linked {_added} report{'s' if _added != 1 else ''} → {_name}",
+                                    icon="🔗",
+                                )
+                                st.rerun()
+                            elif not _errors:
+                                # No-op save — just close edit mode
+                                st.session_state._inst_update_mode.discard(_name)
+                                st.rerun()
+
+                        if _sb2.button("✖", key=f"inst_cancel_{_name}", help="Cancel"):
+                            st.session_state._inst_update_mode.discard(_name)
+                            st.rerun()
+                        if _sb3.button("🗑️", key=f"inst_del_{_name}",
+                                       help=f"Remove {_name} from watchlist"):
+                            remove_institution(_name)
+                            st.session_state._inst_update_mode.discard(_name)
+                            st.rerun()
+
+                # ───────────────────────── DISPLAY MODE ─────────────────────────
+                else:
+                    with _ic2:
+                        if not _doc_ids:
+                            st.markdown("_— not yet linked —_")
+                        else:
+                            for _doc_id in _doc_ids:
+                                _star = "⭐ " if _doc_id == _primary_id else "•  "
+                                st.markdown(
+                                    f"{_star}_{_doc_label_short(_doc_id)}_"
+                                )
+                    if _ic3.button("Update here",
+                                   key=f"inst_edit_{_name}",
+                                   use_container_width=True):
+                        st.session_state._inst_update_mode.add(_name)
+                        st.rerun()
+
+    st.divider()
+
+    # Add new institution
+    with st.form("inst_add_form", clear_on_submit=True):
+        _inst_col1, _inst_col2 = st.columns([4, 1])
+        _new_inst = _inst_col1.text_input(
+            "Institution name",
+            placeholder="e.g. Goldman Sachs, BlackRock, JPMorgan…",
+            label_visibility="collapsed",
+        )
+        _inst_submitted = _inst_col2.form_submit_button("➕ Add", use_container_width=True)
+    if _inst_submitted:
+        if _new_inst.strip():
+            if add_institution(_new_inst.strip()):
+                st.toast(f"Added '{_new_inst.strip()}' to coverage watchlist", icon="🏦")
+                st.rerun()
+            else:
+                st.warning(f"'{_new_inst.strip()}' is already in the list.")
+
+    st.divider()
 
     # --- INGESTION MODULE ---
     col_pdf, col_sec = st.columns(2)
@@ -2265,7 +3739,10 @@ with tab7:
     st.divider()
 
     # --- LIBRARY MANAGER (re-categorize / delete) ---
-    _library_docs = _list_documents()
+    # Reuse the single _lib_docs fetched at the top of the tab — saves a full
+    # paginated ChromaDB pass on every render. Aliased name kept for clarity
+    # vs the institutional-coverage section's _mr_docs slice above.
+    _library_docs = _lib_docs
     _uncat_count = sum(1 for d in _library_docs if d["category"] == "uncategorized")
     _manager_header = "🗂️ Categorize / Manage Existing PDFs"
     if _uncat_count:
@@ -2353,6 +3830,10 @@ with tab7:
                 with c3:
                     if st.button("🗑️", key=f"del_{d['doc_id']}", help="Remove from library"):
                         _delete_document(d["doc_id"])
+                        # Cascade: drop this doc from every institution AND
+                        # every catalyst that linked it — no dangling refs.
+                        unlink_doc_from_all_institutions(d["doc_id"])
+                        unlink_doc_from_all_catalysts(d["doc_id"])
                         st.rerun()
 
     st.divider()
@@ -2454,90 +3935,281 @@ with tab7:
         elif not os.path.exists(DB_DIR) or not os.listdir(DB_DIR):
             st.warning("Your library is empty. Please upload a PDF or rip an SEC filing first.")
         else:
-            with st.spinner("Initializing Omni-Context Engine (Macro, Market, Peer, and Wall Street Consensus)..."):
+            with st.spinner("Initializing Omni-Context Engine (Macro, Market, FMP, SimFin, Technicals, Sentiment…)..."):
+                # --------------------------------------------------------------
+                # Parallel context-injection fetchers.
+                # Previously these ran sequentially: ~10 separate I/O calls
+                # adding 8–12 s on a cold cache. Each fetcher now runs in its
+                # own thread and returns the *complete* injection string (or
+                # "" on failure / when not applicable). The thread pool waits
+                # for all of them before assembling the prompt.
+                # --------------------------------------------------------------
+                def _fetch_macro_block() -> str:
+                    if not fred:
+                        return ""
+                    try:
+                        fed_df = fetch_macro_data("FEDFUNDS")
+                        hy_df  = fetch_macro_data("BAMLH0A0HYM2")
+                        rate_val = f"{fed_df['Value'].iloc[-1]:.2f}%" if (fed_df is not None and not fed_df.empty) else "Unknown"
+                        hy_val   = f"{hy_df['Value'].iloc[-1]:.2f}%"  if (hy_df  is not None and not hy_df.empty)  else "Unknown"
+                        return (
+                            f"\nLIVE MACRO & CREDIT ENVIRONMENT:\n"
+                            f"- Current Federal Funds Rate: {rate_val}\n"
+                            f"- High Yield Credit Spread (Corporate Stress): {hy_val}\n"
+                        )
+                    except Exception:
+                        return ""
+
+                def _fetch_market_and_forward() -> tuple[str, str]:
+                    """Returns (market_injection, forward_injection) — two blocks
+                    derived from the same yfinance call so they share work."""
+                    if not context_ticker:
+                        return "", ""
+                    try:
+                        live_p_data = fetch_live_prices([context_ticker])
+                        p_info      = live_p_data.get(context_ticker, {})
+                        curr_price  = p_info.get('price', 'N/A')
+                        day_change  = p_info.get('change', 'N/A')
+
+                        hist, info  = fetch_stock_details(context_ticker, "1M")
+                        mkt_cap     = format_large_number(info.get('marketCap'))
+                        pe          = info.get('trailingPE', 'N/A')
+                        fwd_pe      = info.get('forwardPE', 'N/A')
+                        target_price = info.get('targetMeanPrice', 'N/A')
+                        rec         = info.get('recommendationKey', 'N/A').upper()
+                        rev_growth  = info.get('revenueGrowth', 0)
+                        earn_growth = info.get('earningsGrowth', 0)
+
+                        rev_str  = f"{rev_growth * 100:.1f}%"  if rev_growth  else "N/A"
+                        earn_str = f"{earn_growth * 100:.1f}%" if earn_growth else "N/A"
+
+                        trend_str = "N/A"
+                        if not hist.empty and len(hist) > 20:
+                            month_ago = hist['Close'].iloc[-21]
+                            latest    = hist['Close'].iloc[-1]
+                            trend_pct = ((latest - month_ago) / month_ago) * 100
+                            trend_str = f"{trend_pct:.2f}%"
+
+                        mkt = (
+                            f"\nLIVE MARKET VALUATION FOR {context_ticker}:\n"
+                            f"- Current Price: ${curr_price} (Day Change: {day_change}%)\n"
+                            f"- 1-Month Trend: {trend_str}\n"
+                            f"- Market Cap: {mkt_cap}\n"
+                            f"- P/E Ratio (Trailing): {pe} | P/E Ratio (Forward): {fwd_pe}\n"
+                        )
+                        fwd = (
+                            f"\nWALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:\n"
+                            f"- Mean Target Price: ${target_price}\n"
+                            f"- Analyst Consensus: {rec}\n"
+                            f"- Est. Forward Revenue Growth: {rev_str}\n"
+                            f"- Est. Forward Earnings Growth: {earn_str}\n"
+                        )
+                        return mkt, fwd
+                    except Exception:
+                        return (
+                            f"\nLIVE MARKET VALUATION FOR {context_ticker}: Temporarily Unavailable.\n",
+                            "",
+                        )
+
+                def _fetch_news_block() -> str:
+                    if not context_ticker:
+                        return ""
+                    try:
+                        recent_news = fetch_financial_news(context_ticker)
+                        if not recent_news:
+                            return (
+                                f"\nLIVE NEWS ENVIRONMENT FOR {context_ticker}:\n"
+                                f"- No major institutional headlines in the last 24 hours.\n"
+                            )
+                        body = f"\nLIVE NEWS ENVIRONMENT FOR {context_ticker}:\n"
+                        for article in recent_news:
+                            body += f"- {article['title']} ({article['time']})\n"
+                        return body
+                    except Exception:
+                        return ""
+
+                def _fetch_fmp_block() -> str:
+                    if not context_ticker or not has_fmp():
+                        return ""
+                    try:
+                        _fmp_p  = fetch_fmp_profile(context_ticker)
+                        _fmp_t  = fetch_fmp_price_targets(context_ticker)
+                        _fmp_r  = fetch_fmp_ratings(context_ticker)
+                        _fmp_e  = fetch_fmp_analyst_estimates(context_ticker)
+                        _flines = [f"\nFMP ANALYST DATA FOR {context_ticker}:"]
+                        if _fmp_p:
+                            _flines.append(
+                                f"- Sector: {_fmp_p.get('sector','N/A')} | "
+                                f"Industry: {_fmp_p.get('industry','N/A')} | "
+                                f"CEO: {_fmp_p.get('ceo','N/A')}"
+                            )
+                        if _fmp_t:
+                            _flines.append(
+                                f"- Price Targets: Low ${_fmp_t.get('priceTargetLow','N/A')} | "
+                                f"Avg ${_fmp_t.get('priceTargetAverage') or _fmp_t.get('priceTarget','N/A')} | "
+                                f"High ${_fmp_t.get('priceTargetHigh','N/A')}"
+                            )
+                        if _fmp_r:
+                            _flines.append(
+                                f"- FMP Rating: {_fmp_r.get('rating','N/A')} "
+                                f"({_fmp_r.get('ratingRecommendation','N/A')})"
+                            )
+                        if _fmp_e is not None and not _fmp_e.empty:
+                            _er = _fmp_e.iloc[0]
+                            _rev = _er.get("Est. Revenue")
+                            _rev_s = (f"${float(_rev)/1e9:.2f}B" if _rev and float(_rev) > 1e9
+                                      else f"${float(_rev)/1e6:.0f}M" if _rev else "N/A")
+                            _flines.append(
+                                f"- Next Period ({_er.get('Period','')}): "
+                                f"Est EPS ${_er.get('Est. EPS','N/A')}, "
+                                f"Est Rev {_rev_s}"
+                            )
+                        return "\n".join(_flines) + "\n"
+                    except Exception:
+                        return ""
+
+                def _fetch_simfin_block() -> str:
+                    if not context_ticker or not has_simfin():
+                        return ""
+                    try:
+                        _sf = fetch_simfin_statements(context_ticker, period="annual")
+                        if not _sf:
+                            return ""
+                        _sflines = [f"\nSIMFIN STANDARDISED FINANCIALS FOR {context_ticker}:"]
+                        _der = _sf.get("derived")
+                        if _der is not None and not _der.empty:
+                            _d = _der.iloc[0]
+                            def _rv(col, fmt="{:.2f}"):
+                                try: return fmt.format(float(_d[col]))
+                                except Exception: return "N/A"
+                            _sflines.append(
+                                f"- ROE: {_rv('Return on Equity','{:.1%}')} | "
+                                f"ROA: {_rv('Return on Assets','{:.1%}')} | "
+                                f"Debt/Equity: {_rv('Debt to Equity Ratio','{:.2f}')}"
+                            )
+                            _sflines.append(
+                                f"- P/E: {_rv('Price to Earnings Ratio (EPS Diluted)','{:.1f}x')} | "
+                                f"P/B: {_rv('Price to Book Value','{:.1f}x')} | "
+                                f"FCF Yield: {_rv('Free Cash Flow Yield','{:.1%}')}"
+                            )
+                        _inc = _sf.get("income")
+                        if _inc is not None and not _inc.empty and "Revenue" in _inc.columns:
+                            _tparts = []
+                            for _, _row in _inc.head(3).iterrows():
+                                _yr = _row.get("Fiscal Year","?")
+                                try:
+                                    _rv2 = float(_row["Revenue"])
+                                    _rv_s = f"${_rv2/1e9:.2f}B" if _rv2 > 1e9 else f"${_rv2/1e6:.0f}M"
+                                except Exception:
+                                    _rv_s = "N/A"
+                                _tparts.append(f"{_yr}: {_rv_s}")
+                            _sflines.append("- Revenue trend: " + " → ".join(_tparts))
+                        return "\n".join(_sflines) + "\n"
+                    except Exception:
+                        return ""
+
+                def _fetch_technicals_block() -> str:
+                    if not context_ticker or not has_alpha_vantage():
+                        return ""
+                    try:
+                        _av  = fetch_av_indicators(context_ticker)
+                        _avl = _av.get("latest", {})
+                        if not _avl:
+                            return ""
+                        _avlines = [f"\nTECHNICAL SIGNALS FOR {context_ticker}:"]
+                        _rsi = _avl.get("rsi")
+                        if _rsi is not None:
+                            _rsi_lbl = ("Overbought" if _rsi > 70 else
+                                        "Oversold" if _rsi < 30 else "Neutral")
+                            _avlines.append(f"- RSI(14): {_rsi:.1f} — {_rsi_lbl}")
+                        _mhist = _avl.get("macd_hist")
+                        _mval  = _avl.get("macd")
+                        if _mval is not None:
+                            _mdir = "Bullish" if (_mhist or 0) > 0 else "Bearish"
+                            _avlines.append(
+                                f"- MACD Histogram: {_mhist:+.4f} → {_mdir} momentum"
+                            )
+                        _bbu = _avl.get("bb_upper")
+                        _bbl = _avl.get("bb_lower")
+                        _bbm = _avl.get("bb_middle")
+                        if _bbu and _bbl:
+                            _avlines.append(
+                                f"- Bollinger Bands: ${_bbl:.2f} — ${_bbm:.2f} — ${_bbu:.2f}"
+                            )
+                        return "\n".join(_avlines) + "\n"
+                    except Exception:
+                        return ""
+
+                def _fetch_sentiment_block() -> str:
+                    """CNN Fear & Greed — always runs, no ticker required."""
+                    try:
+                        _fg = fetch_fear_greed()
+                        if _fg and _fg.get("score") is not None:
+                            return (
+                                f"\nMARKET SENTIMENT (CNN Fear & Greed): "
+                                f"{_fg['score']:.0f}/100 — {_fg.get('rating','')}\n"
+                            )
+                    except Exception:
+                        pass
+                    return ""
+
+                def _fetch_peer_block() -> str:
+                    if not context_group or context_group == "None":
+                        return ""
+                    try:
+                        g_tickers = peer_groups[context_group]
+                        if not g_tickers:
+                            return ""
+                        p_df = fetch_peer_metrics(g_tickers)
+                        if p_df.empty:
+                            return ""
+                        body = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}):\n"
+                        for _, r in p_df.iterrows():
+                            body += (
+                                f"- {r['Ticker']}: Price: ${r['Price']} | "
+                                f"Trailing P/E: {r['P/E (Trailing)']} | "
+                                f"EV/EBITDA: {r['EV/EBITDA']} | "
+                                f"ROE: {r['ROE (%)']}% | "
+                                f"D/E: {r['Debt/Equity']}\n"
+                            )
+                        return body
+                    except Exception:
+                        return f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}): Temporarily Unavailable.\n"
+
+                # ---- Fan out all fetchers in parallel ----
+                # 8 workers covers the 8 independent I/O blocks. Cold-cache
+                # latency is now bounded by the slowest single fetch (typically
+                # FMP at ~3 s) rather than the sum of all fetches.
+                with _fut.ThreadPoolExecutor(max_workers=8) as _pool:
+                    _f_macro      = _pool.submit(_fetch_macro_block)
+                    _f_market_fwd = _pool.submit(_fetch_market_and_forward)
+                    _f_news       = _pool.submit(_fetch_news_block)
+                    _f_fmp        = _pool.submit(_fetch_fmp_block)
+                    _f_simfin     = _pool.submit(_fetch_simfin_block)
+                    _f_tech       = _pool.submit(_fetch_technicals_block)
+                    _f_sent       = _pool.submit(_fetch_sentiment_block)
+                    _f_peer       = _pool.submit(_fetch_peer_block)
+
+                    def _safe_result(fut, default=""):
+                        try:
+                            return fut.result(timeout=60)
+                        except Exception:
+                            return default
+
+                    macro_injection      = _safe_result(_f_macro)
+                    market_injection, forward_injection = _safe_result(_f_market_fwd, ("", ""))
+                    news_injection       = _safe_result(_f_news)
+                    fmp_injection        = _safe_result(_f_fmp)
+                    simfin_injection     = _safe_result(_f_simfin)
+                    technicals_injection = _safe_result(_f_tech)
+                    sentiment_injection  = _safe_result(_f_sent)
+                    peer_injection       = _safe_result(_f_peer)
+
+                # The retrieval pipeline + LLM call still sits inside a single
+                # try/except (matching the original handler at the bottom of
+                # this `with` block) so any RAG / Ollama / Anthropic failure
+                # is surfaced via st.error rather than crashing the page.
                 try:
-                    macro_injection = ""
-                    if fred:
-                        try:
-                            fed_df = fetch_macro_data("FEDFUNDS")
-                            hy_df = fetch_macro_data("BAMLH0A0HYM2")
-                            rate_val = f"{fed_df['Value'].iloc[-1]:.2f}%" if (fed_df is not None and not fed_df.empty) else "Unknown"
-                            hy_val = f"{hy_df['Value'].iloc[-1]:.2f}%" if (hy_df is not None and not hy_df.empty) else "Unknown"
-                            macro_injection = f"\nLIVE MACRO & CREDIT ENVIRONMENT:\n- Current Federal Funds Rate: {rate_val}\n- High Yield Credit Spread (Corporate Stress): {hy_val}\n"
-                        except:
-                            pass 
-
-                    news_injection = ""
-                    market_injection = ""
-                    forward_injection = ""
-                    if context_ticker:
-                        try:
-                            live_p_data = fetch_live_prices([context_ticker])
-                            p_info = live_p_data.get(context_ticker, {})
-                            curr_price = p_info.get('price', 'N/A')
-                            day_change = p_info.get('change', 'N/A')
-                            
-                            hist, info = fetch_stock_details(context_ticker, "1M")
-                            mkt_cap = format_large_number(info.get('marketCap'))
-                            pe = info.get('trailingPE', 'N/A')
-                            fwd_pe = info.get('forwardPE', 'N/A')
-                            
-                            target_price = info.get('targetMeanPrice', 'N/A')
-                            rec = info.get('recommendationKey', 'N/A').upper()
-                            rev_growth = info.get('revenueGrowth', 0)
-                            earn_growth = info.get('earningsGrowth', 0)
-                            
-                            rev_str = f"{rev_growth * 100:.1f}%" if rev_growth else "N/A"
-                            earn_str = f"{earn_growth * 100:.1f}%" if earn_growth else "N/A"
-                            
-                            trend_str = "N/A"
-                            if not hist.empty and len(hist) > 20:
-                                month_ago = hist['Close'].iloc[-21]
-                                latest = hist['Close'].iloc[-1]
-                                trend_pct = ((latest - month_ago) / month_ago) * 100
-                                trend_str = f"{trend_pct:.2f}%"
-
-                            market_injection = f"""
-LIVE MARKET VALUATION FOR {context_ticker}:
-- Current Price: ${curr_price} (Day Change: {day_change}%)
-- 1-Month Trend: {trend_str}
-- Market Cap: {mkt_cap}
-- P/E Ratio (Trailing): {pe} | P/E Ratio (Forward): {fwd_pe}
-"""
-                            forward_injection = f"""
-WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
-- Mean Target Price: ${target_price}
-- Analyst Consensus: {rec}
-- Est. Forward Revenue Growth: {rev_str}
-- Est. Forward Earnings Growth: {earn_str}
-"""
-                        except Exception:
-                            market_injection = f"\nLIVE MARKET VALUATION FOR {context_ticker}: Temporarily Unavailable.\n"
-
-                        try:
-                            recent_news = fetch_financial_news(context_ticker)
-                            if recent_news:
-                                news_injection = f"\nLIVE NEWS ENVIRONMENT FOR {context_ticker}:\n"
-                                for article in recent_news:
-                                    news_injection += f"- {article['title']} ({article['time']})\n"
-                            else:
-                                news_injection = f"\nLIVE NEWS ENVIRONMENT FOR {context_ticker}:\n- No major institutional headlines in the last 24 hours.\n"
-                        except:
-                            pass
-
-                    peer_injection = ""
-                    if context_group and context_group != "None":
-                        try:
-                            g_tickers = peer_groups[context_group]
-                            if g_tickers:
-                                p_df = fetch_peer_metrics(g_tickers)
-                                if not p_df.empty:
-                                    peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}):\n"
-                                    for _, r in p_df.iterrows():
-                                        peer_injection += f"- {r['Ticker']}: Price: ${r['Price']} | Trailing P/E: {r['P/E (Trailing)']} | EV/EBITDA: {r['EV/EBITDA']} | ROE: {r['ROE (%)']}% | D/E: {r['Debt/Equity']}\n"
-                        except Exception:
-                            peer_injection = f"\nLIVE PEER GROUP VALUATION MATRIX ({context_group}): Temporarily Unavailable.\n"
-                
                     # --- Retrieval pipeline: (optional multi-query) + filtered MMR ---
                     # Resolve effective category filter — if the user kept the full set
                     # selected, don't filter by category at all.
@@ -2591,38 +4263,90 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
                             context = "\n\n".join([doc.page_content for doc in retrieved_docs])
                             citation_rule = ""
 
-                        rag_prompt = f"""You are analyzing a user query based strictly on the provided DOCUMENT CONTEXT. You MUST factor in the LIVE MACRO & CREDIT ENVIRONMENT, MARKET VALUATION, WALL STREET CONSENSUS, PEER GROUP MATRIX, and LIVE NEWS provided below to form a sophisticated, forward-looking thesis designed to maximize profit and identify market mispricings.
+                        rag_prompt = f"""You are analyzing a user query using the provided DOCUMENT CONTEXT plus live data from multiple financial APIs. Synthesize ALL available context sections below to form a rigorous, forward-looking research answer — cross-referencing the live quantitative signals with the qualitative evidence in the documents.
 
-                        {macro_injection}
-                        {market_injection}
-                        {forward_injection}
-                        {peer_injection}
-                        {news_injection}
+{macro_injection}{sentiment_injection}{market_injection}{forward_injection}{fmp_injection}{simfin_injection}{technicals_injection}{peer_injection}{news_injection}
+DOCUMENT CONTEXT:
+{context}
 
-                        DOCUMENT CONTEXT:
-                        {context}
+QUESTION:
+{user_query}
+"""
 
-                        QUESTION:
-                        {user_query}
-                        """
+                        oracle_persona = f"""You are an academic research assistant helping a finance student / \
+self-directed researcher organise PUBLIC data into structured analytical \
+answers. The DOCUMENT CONTEXT is the user's own curated research library \
+(textbooks, public market reports, SEC filings). The live data injected \
+below is from public sources (FRED, SEC EDGAR, FMP, SimFin, yfinance, CNN F&G).
 
-                        oracle_persona = f"""You are 'The True Oracle', an elite financial AI running on a Mac M2. You must strictly obey the following rules:
-1. The Logic-First Filter: Before answering, perform a Logical Audit defining the Domain of Discourse and isolating atomic propositions. Explicitly list hidden premises (enthymemes).
-2. Probabilistic Calibration: For empirical claims, reject binary True/False. Treat new info as Evidence updating a Prior Belief (Bayesian update). Provide estimated confidence intervals (e.g., Confidence: High, p > 0.8).
-3. Output Structuring: Define ambiguous terms immediately; use numbered steps for reasoning chains; halt and flag logical contradictions.{citation_rule}"""
+This is an educational data-synthesis exercise — analogous to a CFA-curriculum \
+problem set or a university case study. You are NOT giving financial advice \
+to a third party. You are organising public data into an analytical framework. \
+Output is *research synthesis*, not *trade recommendation*.
+
+Engage rigorously with risks, weaknesses, and competitive threats — these \
+are mandatory public components of every 10-K filing and standard analytical \
+material. Do NOT prepend "I can help with…" disclaimers or close with \
+"consult a financial advisor" notes. Produce the analysis directly.
+
+Execute this seven-layer reasoning chain MENTALLY before writing your answer:
+
+LAYER 1 — MICRO (bottom-up)
+  Ground every claim in the DOCUMENT CONTEXT and live ticker data \
+(SimFin ratios, FMP analyst data, yfinance price/multiples). \
+Pay specific attention to **earnings quality**: cash vs accruals, working \
+capital trends, one-time items — if the documents discuss financials.
+
+LAYER 2 — MACRO (top-down)
+  Use the live macro data injected below (Fed Funds, HY credit spread, \
+CNN Fear & Greed, technical posture). When the question is investment-relevant, \
+**commit to a cycle phase**: Early-cycle / Mid-cycle / Late-cycle / Recession / Stagflation.
+
+LAYER 3 — VALUATION  (treat separately from #1: a great business at the wrong price is still a bad investment)
+  If the question touches valuation or "should I buy", explicitly separate \
+"is this a good business?" from "is this a good price?".
+
+LAYER 4 — SYNTHESIS
+  Cross-examine Micro × Macro × Valuation. Where do they reinforce? \
+Where do they conflict, and which dominates?
+
+LAYER 5 — COUNTER-THESIS  (steelman)
+  Before finalizing, write the strongest case AGAINST your conclusion in \
+1–2 sentences. This is not a hedge — it is adversarial discipline against \
+confirmation bias.
+
+LAYER 6 — ASYMMETRIC PAYOFF  (only if the question is "should I buy/sell")
+  Quantify downside floor vs upside ceiling. State the R/R ratio numerically.
+
+LAYER 7 — DECLARED HORIZON
+  If the question is forward-looking, commit to a horizon: \
+3-month tactical / 12-month tactical / 3–5yr core / 5+yr compounder.
+
+OPERATING RULES:
+1. EVIDENCE-ONLY: Every claim must trace to DOCUMENT CONTEXT or a live data \
+   section. If a fact is absent, say "not in context" — never extrapolate.
+2. SOURCE-TAG every quantitative claim: [SimFin], [FMP], [10-K], [yfinance], \
+   [FRED], [chunk_N], [F&G], [AV], [news]. Untagged numbers will be assumed hallucinated.
+3. PROBABILITY-CALIBRATED CONFIDENCE: percentage probabilities with a horizon \
+   (e.g., "60–70% over 12 months"), never coarse Low/Medium/High labels.
+4. DATA HIERARCHY when sources conflict: SimFin/FMP > SEC > yfinance > news.{citation_rule}
+
+OUTPUT STRUCTURE — use these labelled sections:
+**Micro Analysis** · **Macro Analysis** (with explicit cycle call when applicable) · \
+**Valuation** (when relevant) · **Synthesis** · **Counter-Thesis** · \
+**Conclusion** (with stance, probability range, and declared horizon)."""
 
                         st.success("### Oracle's Synthesis")
 
                         def _stream_oracle():
-                            for chunk in ollama.chat(
-                                model='llama3.2',
-                                messages=[
+                            from llm_router import llm_chat as _llm_chat
+                            yield from _llm_chat(
+                                [
                                     {'role': 'system', 'content': oracle_persona},
                                     {'role': 'user', 'content': rag_prompt},
                                 ],
                                 stream=True,
-                            ):
-                                yield chunk['message']['content']
+                            )
 
                         full_answer = st.write_stream(_stream_oracle())
                         st.session_state['oracle_answer'] = full_answer
@@ -2688,14 +4412,77 @@ WALL STREET CONSENSUS & FORWARD EXPECTATIONS FOR {context_ticker}:
 # ===========================
 # TAB ANALYST: AGENTIC "ANALYZE TICKER" WORKFLOW
 # ===========================
-with tab_analyst:
+
+def _render_analyst_banner(conf: dict) -> None:
+    """Render the structured-signal banner extracted from the memo.
+
+    Surfaces every auditable field from the 7-layer reasoning chain:
+    stance, probability range, declared horizon, cycle-phase call, R/R
+    ratio. Falls back to legacy 'Confidence: Low/Medium/High' for memos
+    generated before the rewrite.
+    """
+    if not conf:
+        return
+    stance = conf.get("stance")
+    if not stance:
+        return
+
+    banner_fn = {
+        "Bullish": st.success,
+        "Bearish": st.error,
+        "Neutral": st.info,
+    }.get(stance, st.info)
+
+    # Prefer the analytical label the LLM produced (e.g. "Constructive")
+    # so the UI reflects the actual research framing, not the legacy mapping.
+    display_label = conf.get("raw_stance") or stance
+    parts = [f"**Posture:** {display_label}"]
+
+    prob = conf.get("probability")
+    if prob and len(prob) == 2:
+        parts.append(f"**Probability:** {prob[0]}–{prob[1]}%")
+
+    horizon = conf.get("horizon")
+    if horizon:
+        parts.append(f"**Horizon:** {horizon}")
+
+    cycle = conf.get("cycle")
+    if cycle:
+        parts.append(f"**Cycle:** {cycle}")
+
+    rr = conf.get("rr_ratio")
+    if rr and len(rr) == 2:
+        try:
+            ratio = rr[1] / rr[0] if rr[0] else None
+            if ratio is not None:
+                rr_label = (
+                    "asymmetric ↑" if ratio >= 1.5 else
+                    "asymmetric ↓" if ratio <= 0.67 else
+                    "symmetric"
+                )
+                parts.append(f"**R/R:** {rr[0]:g}:{rr[1]:g}  _({rr_label})_")
+        except Exception:
+            pass
+
+    # Legacy field — only populated for pre-rewrite memos
+    legacy = conf.get("confidence")
+    if legacy and not prob:
+        parts.append(f"**Confidence:** {legacy}")
+
+    banner_fn("  ·  ".join(parts))
+
+
+if _active == "🧠 Analyst":
     st.header("🧠 Analyze Ticker — Agentic Workflow")
     st.markdown(
-        "A full buy-side memo assembled from **market data + DCF + peers + "
-        "macro + SEC 10-K + recent news + your reference library**, then "
-        "synthesized by Llama 3.2 into a structured Bull / Bear / Confidence "
-        "briefing. Runs data gathering concurrently — expect ~30-60 seconds "
-        "on a cold cache, faster on repeat."
+        "Produces an institutional-grade investment memo via a 7-layer reasoning chain: "
+        "**Micro → Macro → Valuation → Probability-Weighted Scenarios → Counter-Thesis "
+        "→ Asymmetric Payoff → Declared Horizon**. Every quantitative claim is "
+        "source-tagged ([SimFin], [FMP], [10-K], [chunk_N]…), confidence is "
+        "probability-calibrated (e.g. 60–70% over 12 months), and the chain explicitly "
+        "steelmans the opposite view to counter confirmation bias. Data is gathered "
+        "concurrently from yfinance, FMP, SimFin, Alpha Vantage, FRED, SEC EDGAR, "
+        "and your reference library — expect ~30–60 s on a cold cache."
     )
 
     a_col1, a_col2 = st.columns([2, 3])
@@ -2747,15 +4534,19 @@ with tab_analyst:
         else:
             # ---- Live progress panel wired to agent.py via callback ----
             _step_labels = {
-                "market":    "Live market snapshot (yfinance)",
-                "consensus": "Wall Street consensus",
-                "dcf":       "Quick DCF (default assumptions)",
-                "news":      "Recent news (Yahoo RSS)",
-                "peers":     "Peer metrics matrix",
-                "macro":     "Macro & credit (FRED)",
-                "sec":       "SEC 10-K excerpt",
-                "rag":       "Reference library retrieval",
-                "synthesis": "LLM synthesis",
+                "market":     "Live market snapshot (yfinance / Alpaca)",
+                "fmp":        "FMP — analyst targets & ratings",
+                "simfin":     "SimFin — standardised financials & ratios",
+                "technicals": "Alpha Vantage — RSI / MACD / BBands + CNN F&G",
+                "consensus":  "Wall Street consensus (yfinance)",
+                "dcf":        "Quick DCF (default assumptions)",
+                "news":       "Recent news (Yahoo RSS)",
+                "peers":      "Peer metrics matrix",
+                "macro":      "Macro & credit (FRED)",
+                "catalysts":  "🎯 Tracked political / economic catalysts",
+                "sec":        "SEC 10-K excerpt",
+                "rag":        "Reference library retrieval",
+                "synthesis":  "LLM synthesis",
             }
             _status_icons = {
                 "start": "⏳", "done": "✅", "skip": "⚪", "error": "❌",
@@ -2806,17 +4597,8 @@ with tab_analyst:
                 else:
                     st.markdown(envelope.get("memo") or "_(no memo)_")
 
-                # Confidence banner
-                conf = (envelope.get("confidence") or {})
-                stance = conf.get("stance")
-                conf_level = conf.get("confidence")
-                if stance and conf_level:
-                    banner_fn = {
-                        "Bullish": st.success,
-                        "Bearish": st.error,
-                        "Neutral": st.info,
-                    }.get(stance, st.info)
-                    banner_fn(f"**Final Stance:** {stance}  ·  **Confidence:** {conf_level}")
+                # ---- Structured-signal banner (new 7-layer chain) ----
+                _render_analyst_banner(envelope.get("confidence") or {})
 
                 st.session_state["analyst_result"] = envelope
             elif envelope and envelope.get("error"):
@@ -2828,19 +4610,28 @@ with tab_analyst:
         st.divider()
         st.subheader(f"📋 Last Memo — {_cached.get('ticker', '?')}")
         st.markdown(_cached.get("memo") or "_(no memo)_")
-        conf = (_cached.get("confidence") or {})
-        if conf.get("stance") and conf.get("confidence"):
-            banner_fn = {
-                "Bullish": st.success,
-                "Bearish": st.error,
-                "Neutral": st.info,
-            }.get(conf["stance"], st.info)
-            banner_fn(
-                f"**Final Stance:** {conf['stance']}  ·  "
-                f"**Confidence:** {conf['confidence']}"
-            )
+        _render_analyst_banner(_cached.get("confidence") or {})
 
     if _cached:
+        # ---- Catalyst transparency panel ----
+        # Surfaces the exact catalysts the LLM was asked to consider, so the
+        # user can audit whether the memo's §⑨ Watchlist Catalysts section
+        # actually reflects the tracked calendar (and edit/delete entries
+        # inline if any are stale).
+        _cached_catalysts = _cached.get("catalysts") or []
+        if _cached_catalysts:
+            with st.expander(
+                f"🎯 Tracked Catalysts in this Memo ({len(_cached_catalysts)})",
+                expanded=False,
+            ):
+                st.caption(
+                    "These are the catalysts pulled from your **🎯 Catalyst "
+                    "Calendar** that the Analyst LLM was given as context. "
+                    "Click any card to inspect or edit."
+                )
+                for _c in _cached_catalysts:
+                    _render_catalyst_card(_c)
+
         with st.expander("🔎 Raw Context Blocks (what the LLM saw)"):
             blocks = _cached.get("context_blocks") or {}
             for _name, _text in blocks.items():
@@ -2858,3 +4649,1168 @@ with tab_analyst:
                     st.markdown(f"**[chunk_{i}]** `{src}` — *{cat}*")
                     st.caption(d.page_content)
                     st.write("---")
+
+
+# =============================================================================
+#  CATALYSTS SUPERGROUP
+# =============================================================================
+# Forward-looking investment-catalyst engine. Three categories: monetary,
+# contract, court — each with a date, stakes, affected tickers, optional RAG
+# document attachments. The Catalyst Calendar is the centerpiece; the four
+# supporting subtabs (Monetary / Contracts / Court / News) provide the data
+# panels and news context that feed it. Per the design doc:
+#   "telos = foresee pivotal investment catalysts in the realm of politics
+#    and geo-politics to make according profitable investments."
+#
+# NB: `_format_event_date` and `_render_catalyst_card` are defined higher up
+# in the file (right after the nav setup) so the Analyst tab's transparency
+# panel can also render catalyst cards. The form is here because only the
+# Catalyst Calendar tab uses it.
+# =============================================================================
+
+
+def _render_catalyst_form(catalyst: dict | None = None) -> None:
+    """Add (catalyst=None) or edit (catalyst=dict) form, rendered inside an
+    `st.form` so all fields submit atomically."""
+    is_edit = catalyst is not None
+    form_key = f"catalyst_form_{catalyst['id']}" if is_edit else "catalyst_form_new"
+
+    # Pre-fill defaults from the existing catalyst (if editing)
+    default_date     = (
+        _dt.datetime.fromtimestamp(int(catalyst["event_date"])).date()
+        if is_edit else _dt.date.today()
+    )
+    default_title    = catalyst["title"]    if is_edit else ""
+    default_type     = catalyst["catalyst_type"] if is_edit else "monetary"
+    default_category = catalyst.get("category", "") if is_edit else ""
+    default_stakes   = catalyst.get("stakes", "")   if is_edit else ""
+    default_tickers  = ", ".join(catalyst.get("tickers", []))  if is_edit else ""
+    default_sectors  = ", ".join(catalyst.get("sectors", []))  if is_edit else ""
+    default_prob     = catalyst.get("probability", "") if is_edit else ""
+    default_status   = catalyst.get("status", "upcoming") if is_edit else "upcoming"
+    default_outcome  = catalyst.get("outcome_notes", "") if is_edit else ""
+    default_doc_ids  = catalyst.get("doc_ids", []) if is_edit else []
+
+    # Available library docs for the multiselect (any category)
+    try:
+        _all_docs = _list_documents()
+    except Exception:
+        _all_docs = []
+    _doc_options    = [d["doc_id"] for d in _all_docs]
+    _doc_label_map  = {d["doc_id"]: d.get("source", d["doc_id"]) for d in _all_docs}
+
+    with st.form(form_key, clear_on_submit=not is_edit, border=True):
+        st.markdown(f"### {'✏️ Edit catalyst' if is_edit else '➕ Add catalyst'}")
+        c1, c2 = st.columns([3, 2])
+        title = c1.text_input("Title *",
+                              value=default_title,
+                              placeholder="e.g. FOMC December Decision · Quarterly Refunding · "
+                                          "DoD JWCC Phase 2 Award · SCOTUS Loper Bright ruling")
+        ev_date = c2.date_input("Event date *", value=default_date)
+
+        c3, c4, c5 = st.columns(3)
+        ctype = c3.selectbox(
+            "Type *",
+            options=list(CATALYST_TYPES),
+            index=list(CATALYST_TYPES).index(default_type) if default_type in CATALYST_TYPES else 0,
+            format_func=lambda t: CATALYST_TYPE_LABELS.get(t, t),
+        )
+        category = c4.text_input(
+            "Subcategory",
+            value=default_category,
+            placeholder="FOMC · Refunding · Antitrust · Recompete …",
+        )
+        status = c5.selectbox(
+            "Status",
+            options=list(CATALYST_STATUSES),
+            index=list(CATALYST_STATUSES).index(default_status)
+                  if default_status in CATALYST_STATUSES else 0,
+            format_func=lambda s: CATALYST_STATUS_LABELS.get(s, s),
+        )
+
+        stakes = st.text_area(
+            "Stakes (markdown supported) *",
+            value=default_stakes,
+            height=140,
+            placeholder=(
+                "What moves under each scenario, and which way is the asymmetry?\n\n"
+                "**Bull case:** Fed cuts 25 bps → TLT +2-3%, regional banks pop on NIM relief.\n"
+                "**Base case:** Pause, dovish dot plot → muted reaction.\n"
+                "**Bear case:** Hawkish hold → 10Y back above 4.5%, TLT –3%, KRE –2%."
+            ),
+        )
+
+        c6, c7 = st.columns(2)
+        tickers = c6.text_input(
+            "Affected tickers (comma-separated)",
+            value=default_tickers,
+            placeholder="TLT, XLF, KRE",
+        )
+        sectors = c7.text_input(
+            "Affected sectors (comma-separated)",
+            value=default_sectors,
+            placeholder="Financials, REITs, Utilities",
+        )
+
+        c8, c9 = st.columns(2)
+        probability = c8.text_input(
+            "Probability (subjective)",
+            value=default_prob,
+            placeholder="65% pause / 35% cut",
+        )
+        outcome = c9.text_input(
+            "Outcome notes (resolved only)",
+            value=default_outcome,
+            placeholder="Filled after the event resolves",
+        )
+
+        # Library doc attachments (RAG context for the catalyst)
+        linked_docs = st.multiselect(
+            "📎 Attach library docs",
+            options=_doc_options,
+            default=[d for d in default_doc_ids if d in _doc_options],
+            format_func=lambda did: _doc_label_map.get(did, did),
+            help="Briefing memos, opinion pieces, FED minutes — searchable from "
+                 "the Library Oracle. Removes don't delete the doc; they only "
+                 "detach the link.",
+        )
+
+        bcol1, bcol2, _ = st.columns([1, 1, 4])
+        save  = bcol1.form_submit_button("💾 Save", type="primary", use_container_width=True)
+        cancel = bcol2.form_submit_button("✖ Cancel", use_container_width=True)
+
+    if cancel:
+        st.session_state.pop("_catalyst_edit_id", None)
+        st.session_state["_catalyst_form_open"] = False
+        st.rerun()
+
+    if save:
+        if not title.strip():
+            st.error("Title is required.")
+            return
+        ev_ts = int(_dt.datetime.combine(ev_date, _dt.time(0, 0)).timestamp())
+        try:
+            if is_edit:
+                update_catalyst(
+                    catalyst["id"],
+                    event_date    = ev_ts,
+                    title         = title,
+                    catalyst_type = ctype,
+                    category      = category,
+                    stakes        = stakes,
+                    tickers       = [t.strip() for t in tickers.split(",") if t.strip()],
+                    sectors       = [s.strip() for s in sectors.split(",") if s.strip()],
+                    probability   = probability,
+                    status        = status,
+                    outcome_notes = outcome,
+                    doc_ids       = linked_docs,
+                )
+                st.toast(f"Updated catalyst: {title}", icon="✏️")
+            else:
+                new_id = add_catalyst(
+                    event_date    = ev_ts,
+                    title         = title,
+                    catalyst_type = ctype,
+                    category      = category,
+                    stakes        = stakes,
+                    tickers       = [t.strip() for t in tickers.split(",") if t.strip()],
+                    sectors       = [s.strip() for s in sectors.split(",") if s.strip()],
+                    probability   = probability,
+                    status        = status,
+                    outcome_notes = outcome,
+                    doc_ids       = linked_docs,
+                )
+                st.toast(f"Added catalyst (id={new_id})", icon="🎯")
+            st.session_state.pop("_catalyst_edit_id", None)
+            st.session_state["_catalyst_form_open"] = False
+            st.rerun()
+        except Exception as _e:
+            st.error(f"Failed to save catalyst: {_e}")
+
+
+# -------------------- Catalyst Calendar (centerpiece) --------------------
+
+if _active == "🎯 Catalyst Calendar":
+    st.header("🎯 Catalyst Calendar")
+    st.caption(
+        "Forward-looking catalyst engine — track every monetary, contract, and "
+        "court event with a date, an investment thesis, and the affected tickers. "
+        "🟡 Upcoming · 🟢 Live · ✅ Resolved. Click any card to expand the stakes "
+        "or edit the entry; attach Library PDFs for deeper RAG context."
+    )
+
+    # ── Top action bar ──
+    bar1, bar2, bar3, bar4 = st.columns([2, 3, 3, 2])
+    if bar1.button("➕ New catalyst", type="primary", use_container_width=True):
+        st.session_state["_catalyst_form_open"] = True
+        st.session_state.pop("_catalyst_edit_id", None)
+        st.rerun()
+
+    type_filter = bar2.multiselect(
+        "Filter by type",
+        options=list(CATALYST_TYPES),
+        default=[],
+        format_func=lambda t: CATALYST_TYPE_LABELS.get(t, t),
+        placeholder="All types",
+        label_visibility="collapsed",
+    )
+    ticker_filter = bar3.text_input(
+        "Filter by ticker",
+        placeholder="Filter by ticker (e.g. AAPL) — leave blank for all",
+        label_visibility="collapsed",
+    ).strip().upper() or None
+    show_resolved = bar4.toggle(
+        "Show resolved",
+        value=False,
+        help="Include resolved catalysts from the last 60 days at the bottom.",
+    )
+
+    # ── Add/Edit form (only when open) ──
+    if st.session_state.get("_catalyst_form_open"):
+        edit_id = st.session_state.get("_catalyst_edit_id")
+        target  = get_catalyst(edit_id) if edit_id else None
+        _render_catalyst_form(target)
+        st.divider()
+
+    # ── Pull and bucket catalysts ──
+    _filter_kwargs = {
+        "catalyst_types": type_filter or None,
+        "ticker":         ticker_filter,
+    }
+    upcoming = list_catalysts(status="upcoming", **_filter_kwargs)
+    live     = list_catalysts(status="live",     **_filter_kwargs)
+
+    now_ts = int(_dt.datetime.now().timestamp())
+    week_cutoff  = now_ts + 7  * 86400
+    month_cutoff = now_ts + 30 * 86400
+
+    this_week    = [c for c in (live + upcoming) if c["event_date"] <= week_cutoff]
+    next_30_days = [c for c in upcoming
+                    if week_cutoff < c["event_date"] <= month_cutoff]
+    further_out  = [c for c in upcoming if c["event_date"] > month_cutoff]
+
+    # ── ⚡ Bulletin: this week ──
+    st.subheader(f"⚡ This Week ({len(this_week)})")
+    if not this_week:
+        st.caption("_No catalysts in the next 7 days. Add one with **➕ New catalyst**._")
+    for c in this_week:
+        _render_catalyst_card(c, expanded=True)
+
+    # ── 🗓️ Next 30 days ──
+    if next_30_days or not this_week:
+        st.subheader(f"🗓️ Next 30 Days ({len(next_30_days)})")
+        if not next_30_days:
+            st.caption("_Nothing in the 8–30 day window._")
+        for c in next_30_days:
+            _render_catalyst_card(c)
+
+    # ── 📅 Beyond 30 days ──
+    if further_out:
+        with st.expander(f"📅 Beyond 30 days ({len(further_out)})", expanded=False):
+            for c in further_out:
+                _render_catalyst_card(c)
+
+    # ── ✅ Resolved (optional) ──
+    if show_resolved:
+        resolved = list_catalysts(
+            status="resolved",
+            days_behind=60,
+            order="DESC",
+            **{k: v for k, v in _filter_kwargs.items() if k != "status"},
+        )
+        st.subheader(f"✅ Resolved · last 60 days ({len(resolved)})")
+        if not resolved:
+            st.caption("_No resolved catalysts in the last 60 days._")
+        for c in resolved:
+            _render_catalyst_card(c)
+
+    # ── 📊 Analytics (DuckDB-backed) ─────────────────────────────────────
+    # One-pass aggregations over the catalyst corpus. Cheap because DuckDB
+    # runs the query in :memory: against an attached SQLite file — typical
+    # latency well under 50 ms for 1k rows.
+    st.divider()
+    with st.expander("📊 Catalyst Analytics — exposure & density", expanded=False):
+        try:
+            import analytics as _ax
+
+            _ax_c1, _ax_c2 = st.columns(2)
+            with _ax_c1:
+                st.markdown("**Top tickers by catalyst count**")
+                _df_tk = _ax.ticker_exposure(top_n=15)
+                if _df_tk.empty:
+                    st.caption("_No upcoming catalysts._")
+                else:
+                    st.dataframe(
+                        _df_tk,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            with _ax_c2:
+                st.markdown("**Top sectors by catalyst count**")
+                _df_sc = _ax.sector_exposure(top_n=15)
+                if _df_sc.empty:
+                    st.caption("_No tagged sectors._")
+                else:
+                    st.dataframe(
+                        _df_sc,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            st.markdown("**Catalyst density · next 12 months**")
+            _df_dn = _ax.catalyst_density_by_month(months_ahead=12)
+            if _df_dn.empty:
+                st.caption("_No upcoming events in window._")
+            else:
+                # Pivot long-form to wide for a stacked view.
+                _wide = (
+                    _df_dn.pivot(index="month", columns="catalyst_type", values="count")
+                    .fillna(0)
+                    .astype(int)
+                )
+                st.bar_chart(_wide, height=240)
+
+            with st.expander("🛠️ Ad-hoc SQL (read-only) — power users", expanded=False):
+                st.caption(
+                    "Tables are exposed as `portfolio.<table>`. Examples: "
+                    "`portfolio.political_catalysts`, `portfolio.holdings`, "
+                    "`portfolio.transactions`. Connection is READ_ONLY — "
+                    "writes are rejected by DuckDB."
+                )
+                _sql = st.text_area(
+                    "SQL",
+                    value=(
+                        "SELECT title, catalyst_type, "
+                        "strftime(to_timestamp(event_date), '%Y-%m-%d') AS event_date\n"
+                        "FROM portfolio.political_catalysts\n"
+                        "WHERE status='upcoming'\n"
+                        "ORDER BY event_date\n"
+                        "LIMIT 20"
+                    ),
+                    height=140,
+                    key="catalyst_sql_input",
+                )
+                if st.button("▶️ Run query", key="catalyst_sql_run"):
+                    try:
+                        st.dataframe(_ax.run_query(_sql), use_container_width=True)
+                    except Exception as _ex:
+                        st.error(f"Query failed: {_ex}")
+        except Exception as _ex:
+            st.warning(f"Analytics unavailable: {_ex}")
+
+
+# -------------------- Monetary Policy --------------------
+
+if _active == "🏛️ Monetary Policy":
+    st.header("🏛️ Monetary Policy")
+    st.caption(
+        "Federal-reserve and Treasury catalysts that move company earnings "
+        "power. Live FRED data above the fold, calendar auto-import below it, "
+        "and a roll-up of every monetary catalyst on the calendar at the bottom."
+    )
+
+    # ─────────────── Live FRED KPI strip ───────────────
+    if not fred:
+        st.warning(
+            "FRED API key not configured. Add `FRED_API_KEY` to `.env` to "
+            "enable the live macro panel. The auto-import section below "
+            "still works without it."
+        )
+    else:
+        _kpis = [
+            ("Fed Funds Rate",  "FEDFUNDS",     "{:.2f}%"),
+            ("10-Year Treasury","DGS10",        "{:.2f}%"),
+            ("HY Credit Spread","BAMLH0A0HYM2", "{:.2f}%"),
+            ("Broad Dollar Idx","DTWEXBGS",     "{:.1f}"),
+        ]
+        _cols = st.columns(len(_kpis))
+        for _col, (_label, _series, _fmt) in zip(_cols, _kpis):
+            with _col:
+                _df = fetch_macro_data(_series)
+                if _df is None or _df.empty:
+                    st.metric(_label, "—", "Unavailable")
+                    continue
+                _latest = _df["Value"].iloc[-1]
+                # Pick the closest historical print to "1 year ago" for the delta
+                try:
+                    _yoy_idx = _df.index[_df.index <= (_df.index[-1] - pd.DateOffset(years=1))]
+                    _yoy_val = _df.loc[_yoy_idx[-1], "Value"] if len(_yoy_idx) else None
+                except Exception:
+                    _yoy_val = None
+                _delta = (
+                    f"{(_latest - _yoy_val):+.2f} YoY"
+                    if _yoy_val is not None else None
+                )
+                st.metric(_label, _fmt.format(_latest), _delta)
+                # 1-year sparkline
+                try:
+                    _spark = _df[_df.index >= (_df.index[-1] - pd.DateOffset(years=1))]
+                    if not _spark.empty:
+                        st.line_chart(_spark, height=80, use_container_width=True)
+                except Exception:
+                    pass
+
+    st.divider()
+
+    # ─────────────── Auto-import section ───────────────
+    st.subheader("📅 Auto-import official calendars")
+    st.caption(
+        "One-click adds the published FOMC and Treasury Quarterly Refunding "
+        "schedules to the Catalyst Calendar with pre-filled stakes templates "
+        "you can refine. Re-clicking is safe — already-imported entries are "
+        "skipped automatically."
+    )
+    st.info(
+        "**Heads-up:** Hardcoded from the most recent published Fed / "
+        "Treasury announcements. Verify against "
+        "[federalreserve.gov](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) "
+        "and "
+        "[treasurydirect.gov](https://www.treasurydirect.gov/instit/annceresult/press/preanre/preanre.htm) "
+        "before sizing trades around any specific date."
+    )
+
+    _ic1, _ic2 = st.columns(2)
+    with _ic1:
+        # ── FOMC import ──
+        _fomc_existing = list_catalysts(source="fomc_schedule")
+        _fomc_existing_dates = {c["event_date"] for c in _fomc_existing}
+        _fomc_candidates = get_fomc_schedule()
+        _fomc_to_add = [c for c in _fomc_candidates
+                        if c["event_date"] not in _fomc_existing_dates]
+        st.markdown(f"**FOMC Schedule** — {len(_fomc_existing)} imported, "
+                    f"{len(_fomc_to_add)} new available")
+        if st.button(
+            f"📥 Import {len(_fomc_to_add)} new FOMC events" if _fomc_to_add
+            else "✅ FOMC schedule fully imported",
+            key="mon_import_fomc",
+            disabled=not _fomc_to_add,
+            use_container_width=True,
+        ):
+            n_added = 0
+            for c in _fomc_to_add:
+                try:
+                    add_catalyst(**c)
+                    n_added += 1
+                except Exception:
+                    pass
+            st.toast(f"Imported {n_added} FOMC events", icon="📥")
+            st.rerun()
+
+    with _ic2:
+        # ── Treasury refunding import ──
+        _tr_existing = list_catalysts(source="treasury_refunding")
+        _tr_existing_dates = {c["event_date"] for c in _tr_existing}
+        _tr_candidates = get_treasury_refunding_schedule()
+        _tr_to_add = [c for c in _tr_candidates
+                      if c["event_date"] not in _tr_existing_dates]
+        st.markdown(f"**Treasury Refunding** — {len(_tr_existing)} imported, "
+                    f"{len(_tr_to_add)} new available")
+        if st.button(
+            f"📥 Import {len(_tr_to_add)} new refunding dates" if _tr_to_add
+            else "✅ Refunding schedule fully imported",
+            key="mon_import_treasury",
+            disabled=not _tr_to_add,
+            use_container_width=True,
+        ):
+            n_added = 0
+            for c in _tr_to_add:
+                try:
+                    add_catalyst(**c)
+                    n_added += 1
+                except Exception:
+                    pass
+            st.toast(f"Imported {n_added} Treasury refunding events", icon="📥")
+            st.rerun()
+
+    st.divider()
+
+    # ─────────────── Roll-up: every monetary catalyst on the calendar ───────────────
+    st.subheader("📋 Monetary catalysts on the calendar")
+    _all_mon = list_catalysts(catalyst_types=["monetary"], status="upcoming")
+    if not _all_mon:
+        st.caption(
+            "_No upcoming monetary catalysts yet. Use the auto-import buttons "
+            "above or add custom entries on the **🎯 Catalyst Calendar** tab._"
+        )
+    else:
+        # Bucket: this week, this month, beyond
+        _now_ts = int(_dt.datetime.now().timestamp())
+        _wk = [c for c in _all_mon if c["event_date"] <= _now_ts + 7 * 86400]
+        _mo = [c for c in _all_mon if _now_ts + 7 * 86400
+               < c["event_date"] <= _now_ts + 30 * 86400]
+        _far = [c for c in _all_mon if c["event_date"] > _now_ts + 30 * 86400]
+
+        _r1, _r2, _r3 = st.columns(3)
+        _r1.metric("This week", len(_wk))
+        _r2.metric("Next 30 days", len(_mo))
+        _r3.metric("Beyond 30 days", len(_far))
+
+        st.caption(
+            f"Showing {len(_all_mon)} upcoming monetary catalyst(s). "
+            "Click any card to expand the stakes or jump to the calendar."
+        )
+        for c in _all_mon[:25]:  # cap render to keep the page fast
+            _render_catalyst_card(c)
+        if len(_all_mon) > 25:
+            st.info(
+                f"…and {len(_all_mon) - 25} more. Switch to the "
+                "**🎯 Catalyst Calendar** tab to see them all."
+            )
+
+
+# -------------------- Federal Contracts --------------------
+
+if _active == "🏗️ Federal Contracts":
+    st.header("🏗️ Federal Contracts")
+    st.caption(
+        "Federal procurement intelligence powered by **USAspending.gov** — "
+        "every federal contract awarded to publicly-traded contractors, "
+        "with the dollar values, awarding agencies, and period-of-performance "
+        "end dates. Each contract row has a **📌 Add to calendar** button "
+        "that captures its end date as a recompete catalyst."
+    )
+
+    # ─────────────── Lookup selector ───────────────
+    _ticker_options = ["(custom recipient search)"] + sorted(
+        FEDERAL_CONTRACTOR_TICKERS.keys()
+    )
+    _l1, _l2, _l3 = st.columns([1, 2, 2])
+    _selected_ticker = _l1.selectbox(
+        "Ticker",
+        options=_ticker_options,
+        format_func=lambda t: (
+            t if t.startswith("(") else f"{t} — {FEDERAL_CONTRACTOR_TICKERS[t]}"
+        ),
+        key="fed_contract_ticker",
+        index=1 if len(_ticker_options) > 1 else 0,  # default to first real ticker
+    )
+    if _selected_ticker.startswith("("):
+        _custom = _l2.text_input(
+            "Or search by recipient name",
+            placeholder="e.g. SPACEX, ANDURIL, ELASTIC, …",
+            key="fed_contract_custom",
+        )
+        _search_text  = _custom.strip() if _custom else None
+        _ticker_label = (_custom.strip().upper() if _custom else None)
+    else:
+        _search_text  = FEDERAL_CONTRACTOR_TICKERS[_selected_ticker]
+        _ticker_label = _selected_ticker
+        _l2.markdown(f"**Searching:** `{_search_text}`")
+    _lookback = _l3.slider("Lookback (years)", min_value=1, max_value=5, value=2,
+                           key="fed_contract_lookback")
+
+    if _search_text:
+        with st.spinner(f"Pulling USAspending data for {_search_text}…"):
+            _summary = fetch_usaspending_summary(_search_text, lookback_years=_lookback)
+            _awards  = fetch_usaspending_awards(
+                _search_text, lookback_years=_lookback, limit=50,
+            )
+
+        if _summary is None or _awards is None:
+            st.error(
+                "USAspending API request failed (network or rate-limit). "
+                "Try again in a minute — results are cached for 24 h once "
+                "fetched successfully."
+            )
+        elif not _awards:
+            st.warning(
+                f"No federal contracts found for `{_search_text}` in the "
+                f"last {_lookback} year(s). Try a different recipient name "
+                "or widen the lookback window."
+            )
+        else:
+            # ─────────────── Summary KPI strip ───────────────
+            _k1, _k2, _k3, _k4 = st.columns(4)
+            _k1.metric(
+                f"Total awards ({_lookback}yr)",
+                f"${_summary['total']/1e9:.2f}B" if _summary['total'] >= 1e9
+                else f"${_summary['total']/1e6:.0f}M",
+            )
+            _k2.metric("Top contracts shown", len(_awards))
+            _top_agency = (_summary["top_agencies"][0][0]
+                           if _summary["top_agencies"] else "—")
+            _k3.metric("Top awarding agency", _top_agency[:25])
+            # Count contracts ending within next 18 months (potential recompetes)
+            _now_d = _dt.datetime.now().date()
+            _soon_count = 0
+            for a in _awards:
+                _eds = a.get("End Date") or ""
+                try:
+                    _ed = _dt.datetime.strptime(_eds, "%Y-%m-%d").date()
+                    if _now_d <= _ed <= _now_d + _dt.timedelta(days=18 * 30):
+                        _soon_count += 1
+                except Exception:
+                    pass
+            _k4.metric("Ending in 18 mo", _soon_count, help="Potential recompete catalysts")
+
+            with st.expander("📊 Top awarding agencies", expanded=False):
+                for _ag, _amt in _summary["top_agencies"]:
+                    _amt_s = f"${_amt/1e9:.2f}B" if _amt >= 1e9 else f"${_amt/1e6:.0f}M"
+                    st.markdown(f"- **{_ag}** — {_amt_s}")
+
+            st.divider()
+
+            # ─────────────── Top contracts table ───────────────
+            st.subheader(f"🏆 Top contracts — {_search_text}")
+            st.caption(
+                f"Showing top {len(_awards)} contracts by award amount over "
+                f"the last {_lookback} year(s). Click **📌 Add to calendar** "
+                "on any contract whose end date is within 2 years to log it "
+                "as a recompete catalyst."
+            )
+
+            # Pre-fetch existing recompete catalysts for dedup
+            _existing_recompete = list_catalysts(source="usaspending_recompete")
+            _existing_award_ids = {
+                # Extract Award IDs from titles like "Recompete: FA871523C0001"
+                c.get("title", "").replace("Recompete: ", "").strip()
+                for c in _existing_recompete
+                if c.get("title", "").startswith("Recompete: ")
+            }
+
+            for _i, _award in enumerate(_awards[:25]):
+                _award_id = _award.get("Award ID") or "—"
+                _desc     = (_award.get("Description") or "—")[:240]
+                _amt      = float(_award.get("Award Amount") or 0)
+                _agency   = (_award.get("Awarding Sub Agency")
+                             or _award.get("Awarding Agency") or "—")
+                _eds      = _award.get("End Date") or ""
+
+                with st.container(border=True):
+                    _cc1, _cc2 = st.columns([5, 1])
+                    _amt_s = (f"${_amt/1e9:.2f}B" if _amt >= 1e9
+                              else f"${_amt/1e6:.1f}M" if _amt >= 1e6
+                              else f"${_amt/1e3:.0f}K")
+                    _cc1.markdown(f"**`{_award_id}`** · {_amt_s} · _{_agency}_")
+                    _cc1.caption(_desc + ("…" if len(_desc) >= 240 else ""))
+                    if _eds:
+                        try:
+                            _end_dt   = _dt.datetime.strptime(_eds, "%Y-%m-%d")
+                            _days_out = (_end_dt.date() - _now_d).days
+                            if _days_out >= 0:
+                                _cc1.caption(
+                                    f"📅 Period of Performance ends "
+                                    f"**{_eds}** · in {_days_out} days"
+                                )
+                            else:
+                                _cc1.caption(f"📅 Ended {_eds} · {-_days_out} days ago")
+                        except Exception:
+                            _cc1.caption(f"📅 End date: {_eds}")
+
+                    # Add to calendar button — only if end is in the future and ≤ 2 years out
+                    _can_add = False
+                    _end_ts  = None
+                    if _eds:
+                        try:
+                            _end_dt = _dt.datetime.strptime(_eds, "%Y-%m-%d")
+                            _days_out = (_end_dt.date() - _now_d).days
+                            if 0 < _days_out <= 730:
+                                _can_add = True
+                                _end_ts = int(_end_dt.timestamp())
+                        except Exception:
+                            pass
+
+                    _btn_key = f"addcat_fed_{_i}_{_award_id}"
+                    if _award_id in _existing_award_ids:
+                        _cc2.success("✅ on calendar")
+                    elif _can_add:
+                        if _cc2.button("📌 Add to calendar",
+                                       key=_btn_key, use_container_width=True):
+                            _stakes = (
+                                f"**Contract:** `{_award_id}`\n\n"
+                                f"**Recipient:** {_award.get('Recipient Name', '—')}\n\n"
+                                f"**Amount:** {_amt_s}\n\n"
+                                f"**Awarding agency:** {_agency}\n\n"
+                                f"**Description:** {_desc}\n\n"
+                                f"**Stakes:** Period of Performance ends **{_eds}**. "
+                                f"Recompete decision could result in: continuation "
+                                f"(option year), recompete (incumbent vs new bidders), "
+                                f"or contract termination. Material to "
+                                f"{_ticker_label or 'the recipient'}'s revenue line "
+                                f"if loss occurs to a competitor.\n\n"
+                                f"_Source: USAspending.gov_"
+                            )
+                            try:
+                                add_catalyst(
+                                    event_date    = _end_ts,
+                                    title         = f"Recompete: {_award_id}",
+                                    catalyst_type = "contract",
+                                    category      = "Recompete",
+                                    stakes        = _stakes,
+                                    tickers       = [_ticker_label] if _ticker_label else [],
+                                    sectors       = ["Defense"]
+                                                    if _ticker_label in ("LMT","NOC","GD","RTX","BA","HII")
+                                                    else [],
+                                    source        = "usaspending_recompete",
+                                )
+                                st.toast(f"📌 Added recompete catalyst for {_award_id}",
+                                         icon="🏗️")
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Failed to add catalyst: {_e}")
+                    else:
+                        _cc2.caption("_no end date_" if not _eds else "_>2 yr out_")
+
+            if len(_awards) > 25:
+                st.caption(
+                    f"…and {len(_awards) - 25} more contracts not shown. "
+                    "Increase the lookback window or look up a more specific "
+                    "recipient name to narrow."
+                )
+
+    st.divider()
+
+    # ─────────────── Roll-up: every contract catalyst on the calendar ───────────────
+    st.subheader("📋 Contract catalysts on the calendar")
+    _all_con = list_catalysts(catalyst_types=["contract"], status="upcoming")
+    if not _all_con:
+        st.caption(
+            "_No upcoming contract catalysts yet. Use **📌 Add to calendar** "
+            "on a contract row above, or add custom entries on the "
+            "**🎯 Catalyst Calendar** tab._"
+        )
+    else:
+        _now_ts = int(_dt.datetime.now().timestamp())
+        _wk = [c for c in _all_con if c["event_date"] <= _now_ts + 7  * 86400]
+        _mo = [c for c in _all_con if _now_ts + 7  * 86400
+                < c["event_date"] <= _now_ts + 90 * 86400]
+        _far = [c for c in _all_con if c["event_date"] > _now_ts + 90 * 86400]
+        _r1, _r2, _r3 = st.columns(3)
+        _r1.metric("This week", len(_wk))
+        _r2.metric("Next 90 days", len(_mo))
+        _r3.metric("Beyond 90 days", len(_far))
+        st.caption(
+            f"Showing {min(len(_all_con), 25)} of {len(_all_con)} upcoming "
+            "contract catalyst(s) — most-imminent first."
+        )
+        for c in _all_con[:25]:
+            _render_catalyst_card(c)
+        if len(_all_con) > 25:
+            st.info(
+                f"…and {len(_all_con) - 25} more. Switch to the "
+                "**🎯 Catalyst Calendar** tab to see them all."
+            )
+
+
+# -------------------- Court Docket --------------------
+
+if _active == "⚖️ Court Docket":
+    st.header("⚖️ Court Docket")
+    st.caption(
+        "Pending court rulings and regulatory enforcement actions with material "
+        "company impact — antitrust, patent, securities, SCOTUS. Federal court "
+        "schedules don't have a clean public-API source the way FOMC does, so "
+        "this tab pairs **a curated catalog of major pending cases** with "
+        "**CourtListener search** for ad-hoc lookup."
+    )
+
+    # ─────────────── Curated catalog import (no key needed) ───────────────
+    st.subheader("📚 Curated case catalog")
+    st.caption(
+        "A starter pack of widely-tracked pending cases with investment "
+        "implications. Dates are best-known opinion windows — verify via "
+        "[SCOTUSblog](https://www.scotusblog.com) or "
+        "[CourtListener](https://www.courtlistener.com) before relying on "
+        "any specific date for trades. Re-clicking is safe; already-imported "
+        "entries are skipped."
+    )
+    _existing_court = list_catalysts(source="court_catalog")
+    _existing_court_titles = {c["title"] for c in _existing_court}
+    _court_candidates = get_major_court_cases()
+    _court_to_add = [c for c in _court_candidates
+                     if c["title"] not in _existing_court_titles]
+
+    _ci1, _ci2 = st.columns([1, 3])
+    with _ci1:
+        if st.button(
+            f"📥 Import {len(_court_to_add)} new cases" if _court_to_add
+            else "✅ Catalog fully imported",
+            key="court_import_catalog",
+            disabled=not _court_to_add,
+            use_container_width=True,
+        ):
+            n_added = 0
+            for c in _court_to_add:
+                try:
+                    add_catalyst(**c)
+                    n_added += 1
+                except Exception:
+                    pass
+            st.toast(f"Imported {n_added} court cases", icon="📥")
+            st.rerun()
+
+    with _ci2:
+        if _court_to_add:
+            st.markdown(
+                f"**{len(_existing_court)}** imported · "
+                f"**{len(_court_to_add)}** new available"
+            )
+            with st.expander("Preview the cases that will be imported"):
+                for c in _court_to_add:
+                    _ev = _dt.datetime.fromtimestamp(c["event_date"]).date()
+                    st.markdown(
+                        f"- **{c['title']}** — _{c['category']}_ — "
+                        f"{_ev.isoformat()} · "
+                        f"`{c.get('tickers','')}`"
+                    )
+        else:
+            st.caption(
+                f"All {len(_existing_court)} curated cases are already on "
+                "the calendar."
+            )
+
+    st.divider()
+
+    # ─────────────── CourtListener search ───────────────
+    st.subheader("🔍 Search court records (CourtListener)")
+    if not has_courtlistener():
+        st.info(
+            "**CourtListener** gives access to the full federal RECAP archive "
+            "via a free API key. To enable this lookup:\n\n"
+            "1. Register at "
+            "[courtlistener.com/register](https://www.courtlistener.com/register/)  \n"
+            "2. Copy your API token from your account settings  \n"
+            "3. Add `COURTLISTENER_API_KEY=your_token` to `.env`  \n"
+            "4. Restart the app\n\n"
+            "Until then, log court catalysts manually on the "
+            "**🎯 Catalyst Calendar** tab — the curated catalog above also "
+            "covers the highest-impact cases."
+        )
+    else:
+        _cs1, _cs2 = st.columns([3, 1])
+        _cl_query = _cs1.text_input(
+            "Party / case name",
+            placeholder="e.g. Apple, Tesla, Pfizer, Amazon vs FTC, …",
+            key="court_search_query",
+            label_visibility="collapsed",
+        )
+        _cl_type = _cs2.selectbox(
+            "Source",
+            options=[("r", "RECAP (filings)"),
+                     ("o", "Opinions"),
+                     ("oa", "Oral arguments")],
+            format_func=lambda x: x[1],
+            key="court_search_type",
+            label_visibility="collapsed",
+        )
+
+        if _cl_query and _cl_query.strip():
+            with st.spinner(f"Searching CourtListener for '{_cl_query}'…"):
+                _results = fetch_courtlistener_search(
+                    _cl_query.strip(),
+                    search_type=_cl_type[0],
+                    limit=15,
+                )
+            if _results is None:
+                st.error(
+                    "CourtListener search failed (network or rate-limit). "
+                    "Try again in a minute — successful queries are cached "
+                    "for 24 h."
+                )
+            elif not _results:
+                st.warning(f"No results for `{_cl_query}` in {_cl_type[1]}.")
+            else:
+                st.caption(f"Top {len(_results)} results · most-recent first.")
+                for _i, _hit in enumerate(_results):
+                    with st.container(border=True):
+                        _name = (_hit.get("caseName")
+                                 or _hit.get("case_name")
+                                 or _hit.get("caseNameShort")
+                                 or "(unnamed)")
+                        _court = (_hit.get("court")
+                                  or _hit.get("court_id")
+                                  or "—")
+                        _date = (_hit.get("dateFiled")
+                                 or _hit.get("dateArgued")
+                                 or _hit.get("dateDecided")
+                                 or "—")
+                        _url = _hit.get("absolute_url") or ""
+                        _docket = _hit.get("docketNumber") or ""
+
+                        _hc1, _hc2 = st.columns([5, 1])
+                        _hc1.markdown(f"**{_name}**")
+                        _hc1.caption(
+                            f"{_court}  ·  filed/argued/decided **{_date}**"
+                            + (f"  ·  Docket `{_docket}`" if _docket else "")
+                        )
+                        if _url:
+                            _hc1.markdown(
+                                f"[Open on CourtListener "
+                                f"↗](https://www.courtlistener.com{_url})"
+                            )
+
+                        # Quick-add to calendar (pre-fills with the case info)
+                        if _hc2.button("📌 Add", key=f"court_add_{_i}",
+                                       use_container_width=True,
+                                       help="Add as a court catalyst"):
+                            try:
+                                # Use today + 30 days as a placeholder; the
+                                # user edits the form afterwards to set the
+                                # actual ruling/argument date.
+                                _placeholder_ts = int(
+                                    (_dt.datetime.now() + _dt.timedelta(days=30))
+                                    .timestamp()
+                                )
+                                _new_id = add_catalyst(
+                                    event_date    = _placeholder_ts,
+                                    title         = _name,
+                                    catalyst_type = "court",
+                                    category      = _court,
+                                    stakes        = (
+                                        f"**Court:** {_court}\n\n"
+                                        f"**Filed/Argued/Decided:** {_date}\n\n"
+                                        f"**Docket:** `{_docket or '—'}`\n\n"
+                                        f"**CourtListener:** "
+                                        f"https://www.courtlistener.com{_url}\n\n"
+                                        f"**TODO:** edit this entry on the "
+                                        f"Catalyst Calendar tab to set the "
+                                        f"actual ruling/decision date and "
+                                        f"the affected tickers."
+                                    ),
+                                    source        = "courtlistener_search",
+                                )
+                                st.toast(
+                                    f"Added → edit on Catalyst Calendar to "
+                                    f"set the ruling date",
+                                    icon="📌",
+                                )
+                                # Open the form for immediate editing
+                                st.session_state["_catalyst_edit_id"]   = _new_id
+                                st.session_state["_catalyst_form_open"] = True
+                                st.session_state["active_catalyst_tab"] = (
+                                    "🎯 Catalyst Calendar"
+                                )
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Failed to add: {_e}")
+
+    st.divider()
+
+    # ─────────────── Roll-up: every court catalyst on the calendar ───────────────
+    st.subheader("📋 Court catalysts on the calendar")
+    _all_crt = list_catalysts(catalyst_types=["court"], status="upcoming")
+    if not _all_crt:
+        st.caption(
+            "_No upcoming court catalysts yet. Use the curated catalog or "
+            "CourtListener search above, or add custom entries on the "
+            "**🎯 Catalyst Calendar** tab._"
+        )
+    else:
+        _now_ts = int(_dt.datetime.now().timestamp())
+        _wk = [c for c in _all_crt if c["event_date"] <= _now_ts + 30 * 86400]
+        _qt = [c for c in _all_crt if _now_ts + 30 * 86400
+                < c["event_date"] <= _now_ts + 90 * 86400]
+        _far = [c for c in _all_crt if c["event_date"] > _now_ts + 90 * 86400]
+        _r1, _r2, _r3 = st.columns(3)
+        _r1.metric("Next 30 days", len(_wk))
+        _r2.metric("31-90 days", len(_qt))
+        _r3.metric("Beyond 90 days", len(_far))
+        st.caption(
+            f"Showing {min(len(_all_crt), 25)} of {len(_all_crt)} upcoming "
+            "court catalyst(s) — most-imminent first."
+        )
+        for c in _all_crt[:25]:
+            _render_catalyst_card(c)
+        if len(_all_crt) > 25:
+            st.info(
+                f"…and {len(_all_crt) - 25} more. Switch to the "
+                "**🎯 Catalyst Calendar** tab to see them all."
+            )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 📰 Catalyst News
+# ────────────────────────────────────────────────────────────────────────────
+
+if _active == "📰 Catalyst News":
+    st.header("📰 Catalyst News")
+    st.caption(
+        "Keyword-filtered news stream — headlines scored for policy / monetary / "
+        "contract / court / earnings relevance and auto-tagged to upcoming "
+        "catalysts whose tickers overlap."
+    )
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    _cn_c1, _cn_c2, _cn_c3 = st.columns([2, 2, 1])
+
+    # Ticker scope: portfolio + watchlist + all catalyst tickers
+    _all_upcoming_cats = list_catalysts(status="upcoming") + list_catalysts(status="live")
+    _cat_tickers: list[str] = sorted(
+        {t.upper() for c in _all_upcoming_cats for t in (c.get("tickers") or [])}
+    )
+
+    # Let the user narrow or expand the ticker set
+    _cn_ticker_input = _cn_c1.text_input(
+        "Tickers to scan (comma-separated)",
+        value=", ".join(_cat_tickers[:15]),  # default: first 15 catalyst tickers
+        key="cn_ticker_input",
+        help="Leave blank to scan all catalyst tickers. Add more with commas.",
+    )
+    _cn_tickers_raw = [t.strip().upper() for t in _cn_ticker_input.split(",") if t.strip()]
+    # Fall back to all catalyst tickers if the field is cleared
+    _cn_tickers: tuple[str, ...] = tuple(_cn_tickers_raw or _cat_tickers[:20])
+
+    # Category filter
+    _cn_all_cats = ["(all)"] + list(_CATALYST_KEYWORD_MAP.keys())
+    _cn_cat_filter = _cn_c2.selectbox(
+        "Filter by category",
+        options=_cn_all_cats,
+        index=0,
+        key="cn_cat_filter",
+        format_func=lambda x: x.replace("_", " ").title() if x != "(all)" else "All categories",
+    )
+
+    # Min relevance score slider
+    _cn_min_score = _cn_c3.number_input(
+        "Min score",
+        min_value=1,
+        max_value=10,
+        value=1,
+        step=1,
+        key="cn_min_score",
+        help="Minimum keyword-hit count to display a headline.",
+    )
+
+    _cn_col_r, _cn_col_i = st.columns([1, 5])
+    _cn_refresh = _cn_col_r.button("🔄 Refresh", key="cn_refresh_btn")
+    if _cn_refresh:
+        get_catalyst_news.clear()
+
+    if not _cn_tickers:
+        st.info(
+            "Add at least one ticker above, or import catalysts on the "
+            "**🎯 Catalyst Calendar** / **🏛️ Monetary Policy** / "
+            "**🏗️ Federal Contracts** / **⚖️ Court Docket** tabs first."
+        )
+    else:
+        with st.spinner(f"Scanning news for {len(_cn_tickers)} ticker(s)…"):
+            _cn_articles = get_catalyst_news(
+                _cn_tickers,
+                min_score=int(_cn_min_score),
+            )
+
+        # Apply category filter
+        if _cn_cat_filter != "(all)":
+            _cn_articles = [
+                a for a in _cn_articles if _cn_cat_filter in a.get("scores", {})
+            ]
+
+        # ── Summary strip ─────────────────────────────────────────────────
+        _cn_linked   = [a for a in _cn_articles if a.get("matched_catalysts")]
+        _cn_unlinked = [a for a in _cn_articles if not a.get("matched_catalysts")]
+        _s1, _s2, _s3 = st.columns(3)
+        _s1.metric("Headlines found", len(_cn_articles))
+        _s2.metric("Linked to a catalyst", len(_cn_linked))
+        _s3.metric("Tickers scanned", len(_cn_tickers))
+        st.divider()
+
+        if not _cn_articles:
+            st.info(
+                "No catalyst-relevant headlines found for the selected tickers "
+                "and score threshold. Try lowering **Min score** or adding more "
+                "tickers."
+            )
+        else:
+            # Category breakdown badges (small)
+            _cn_cat_counts: dict[str, int] = {}
+            for _a in _cn_articles:
+                for _cat in _a.get("scores", {}):
+                    _cn_cat_counts[_cat] = _cn_cat_counts.get(_cat, 0) + 1
+            if _cn_cat_counts:
+                _badge_parts = " · ".join(
+                    f"**{k.title()}** {v}"
+                    for k, v in sorted(_cn_cat_counts.items(), key=lambda x: -x[1])
+                )
+                st.caption(f"Category hits: {_badge_parts}")
+
+            # ── Linked section ─────────────────────────────────────────────
+            if _cn_linked:
+                st.subheader(
+                    f"🔗 Catalyst-linked headlines ({len(_cn_linked)})",
+                    help="These headlines mention tickers that appear in at least one "
+                         "upcoming/live catalyst.",
+                )
+                for _art in _cn_linked[:40]:
+                    _art_ts    = _art.get("published_ts") or 0
+                    _art_date  = (
+                        _dt.datetime.fromtimestamp(_art_ts).strftime("%b %d")
+                        if _art_ts else ""
+                    )
+                    _art_score_cats = " · ".join(
+                        f"`{k.title()}` ×{v}"
+                        for k, v in sorted(
+                            _art.get("scores", {}).items(), key=lambda x: -x[1]
+                        )
+                    )
+                    _art_tickers_str = " ".join(
+                        f"`{t}`" for t in _art.get("matched_tickers", [])
+                    )
+                    _art_cats_str = ", ".join(
+                        c.get("title", "") for c in _art.get("matched_catalysts", [])[:3]
+                    )
+                    if len(_art.get("matched_catalysts", [])) > 3:
+                        _art_cats_str += f" +{len(_art['matched_catalysts']) - 3} more"
+
+                    _art_header = (
+                        f"[{_art.get('title', '(no title)')}]({_art.get('url', '#')})"
+                    )
+                    with st.expander(
+                        f"🔗 {_art.get('title', '(no title)')} "
+                        f"— {_art.get('source', '')}  {_art_date}",
+                        expanded=False,
+                    ):
+                        _exp_c1, _exp_c2 = st.columns([3, 2])
+                        with _exp_c1:
+                            if _art.get("summary"):
+                                st.caption(_art["summary"][:280])
+                            st.markdown(
+                                f"[📎 Open article]({_art.get('url', '#')})",
+                                unsafe_allow_html=False,
+                            )
+                        with _exp_c2:
+                            st.caption(
+                                f"**Source:** {_art.get('source', '—')}  \n"
+                                f"**Published:** {_art.get('time', '—')}  \n"
+                                f"**Tickers:** {_art_tickers_str or '—'}  \n"
+                                f"**Score:** {_art.get('total_score', 0)} — "
+                                f"{_art_score_cats}"
+                            )
+                            if _art_cats_str:
+                                st.caption(f"**Catalysts:** {_art_cats_str}")
+                            # Mini catalyst links
+                            for _mc in _art.get("matched_catalysts", [])[:3]:
+                                _mc_date = (
+                                    _dt.datetime.fromtimestamp(_mc["event_date"]).strftime(
+                                        "%b %d, %Y"
+                                    )
+                                    if _mc.get("event_date")
+                                    else "—"
+                                )
+                                st.caption(
+                                    f"🎯 **{_mc.get('title', '')}** · {_mc_date}"
+                                )
+
+            # ── Unlinked section (collapsed by default) ────────────────────
+            if _cn_unlinked:
+                with st.expander(
+                    f"📋 Other catalyst-relevant headlines ({len(_cn_unlinked)}) "
+                    "— no direct ticker match",
+                    expanded=False,
+                ):
+                    for _art in _cn_unlinked[:30]:
+                        _art_ts   = _art.get("published_ts") or 0
+                        _art_date = (
+                            _dt.datetime.fromtimestamp(_art_ts).strftime("%b %d")
+                            if _art_ts else ""
+                        )
+                        _art_score_cats = " · ".join(
+                            f"`{k.title()}` ×{v}"
+                            for k, v in sorted(
+                                _art.get("scores", {}).items(), key=lambda x: -x[1]
+                            )
+                        )
+                        st.markdown(
+                            f"- [{_art.get('title', '(no title)')}]({_art.get('url', '#')})  "
+                            f"*{_art.get('source', '')} · {_art_date} · "
+                            f"score {_art.get('total_score', 0)} — {_art_score_cats}*"
+                        )
