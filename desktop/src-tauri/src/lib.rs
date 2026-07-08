@@ -4,16 +4,27 @@
 
 use std::fs::{self, OpenOptions};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
-const PROJECT_DIR: &str = "/Users/dimitripelletier/Desktop/Projects/NoodleStockTracker";
 const APP_FILE: &str = "app.py";
 const PORT: u16 = 8501;
-const HARDCODED_STREAMLIT: &str = "/Library/Frameworks/Python.framework/Versions/3.13/bin/streamlit";
+
+/// Root of the NoodleStockTracker project. Resolved at compile time relative
+/// to this crate (`desktop/src-tauri`, two levels under the project root)
+/// rather than hardcoded, so a build works correctly no matter where the
+/// repo was cloned — `CARGO_MANIFEST_DIR` reflects *the building machine's*
+/// checkout location, not the original author's.
+fn project_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent() // desktop/
+        .and_then(Path::parent) // NoodleStockTracker/
+        .expect("desktop/src-tauri should sit two levels under the project root")
+        .to_path_buf()
+}
 
 fn port_is_open(port: u16) -> bool {
     TcpStream::connect_timeout(
@@ -23,12 +34,12 @@ fn port_is_open(port: u16) -> bool {
     .is_ok()
 }
 
+/// Resolves the `streamlit` binary via the user's login shell PATH, since
+/// GUI-launched apps don't inherit the interactive shell environment. Not
+/// hardcoded to a specific Python install, so this works for any Python
+/// setup (framework build, Homebrew, pyenv, a venv activated in .zshrc, etc.)
+/// as long as `streamlit` is installed and on PATH.
 fn resolve_streamlit_bin() -> Option<String> {
-    if Path::new(HARDCODED_STREAMLIT).exists() {
-        return Some(HARDCODED_STREAMLIT.to_string());
-    }
-    // Fall back to whatever `streamlit` resolves to via the login shell PATH,
-    // since GUI-launched apps don't inherit the user's shell environment.
     let output = Command::new("/bin/zsh")
         .args(["-lc", "command -v streamlit"])
         .output()
@@ -59,8 +70,9 @@ fn ensure_server_running() -> bool {
         return false;
     };
 
-    if !Path::new(PROJECT_DIR).is_dir() {
-        show_error_dialog(&format!("Project directory not found: {PROJECT_DIR}"));
+    let project_dir = project_dir();
+    if !project_dir.is_dir() {
+        show_error_dialog(&format!("Project directory not found: {}", project_dir.display()));
         return false;
     }
 
@@ -89,7 +101,7 @@ fn ensure_server_running() -> bool {
             "--browser.gatherUsageStats",
             "false",
         ])
-        .current_dir(PROJECT_DIR)
+        .current_dir(&project_dir)
         .stdout(log_file.map(Stdio::from).unwrap_or_else(Stdio::null))
         .stderr(log_file_err.map(Stdio::from).unwrap_or_else(Stdio::null))
         .spawn();
