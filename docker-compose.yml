@@ -14,7 +14,7 @@ services:
   watcher:
     build: .
     container_name: stock_tracker_watcher
-    command: python "Stock Watcher.py"
+    command: python watcher.py
     volumes:
       - .:/app
     env_file:
