@@ -8,6 +8,7 @@ import os
 import threading as _threading
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 import llm_router as _llm_router
 from ui.common import DB_DIR, UPLOAD_DIR, bg_prefetch, load_data
@@ -30,9 +31,13 @@ if "_lazy_loaded" not in st.session_state:
 # ── Background prefetch ──────────────────────────────────────────────────────
 if "_bg_prefetch_started" not in st.session_state:
     st.session_state._bg_prefetch_started = True
-    _threading.Thread(
+    _prefetch_thread = _threading.Thread(
         target=bg_prefetch, args=(app_data,), daemon=True
-    ).start()
+    )
+    # Attach the script context so cache writes land in st.cache_data (the cache
+    # the tabs read) instead of the context-less fallback dict.
+    add_script_run_ctx(_prefetch_thread, get_script_run_ctx())
+    _prefetch_thread.start()
 
 
 # ── Sidebar: LLM backend selector ────────────────────────────────────────────

@@ -5,6 +5,7 @@ portfolio.db
 portfolio.db-journal
 portfolio.db-wal
 portfolio.db-shm
+portfolio.db.*
 .venv/
 __pycache__/
 .DS_Store

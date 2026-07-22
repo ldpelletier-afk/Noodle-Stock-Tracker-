@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -881,27 +882,44 @@ def _pretty_source_from_domain(domain: str) -> str:
 _LIVE_PRICE_TTL = 30 if (ALPACA_API_KEY and ALPACA_SECRET_KEY) else 60
 
 
-@cache_data(ttl=_LIVE_PRICE_TTL)
-def fetch_live_prices(tickers):
-    """Return ``{ticker: {"price": float|None, "change": float|None}}``.
+# ── Per-ticker live-price store ───────────────────────────────────────────────
+# A single, process-wide, thread-safe cache keyed by *individual* ticker (not by
+# the exact list a caller passes). Because every Portfolio tab requests a
+# different subset of tickers (holdings, one watchlist, favourites, …), keying
+# the cache on the whole list — as a plain @cache_data would — means overlapping
+# requests never share data and each tab pays its own cold fetch. Keying per
+# ticker lets the first fetch of a symbol (including the startup prefetch, which
+# runs in a background thread with no Streamlit context) serve every tab for the
+# next ``_LIVE_PRICE_TTL`` seconds.
+_live_price_store: dict[str, tuple[dict, float]] = {}
+_live_price_lock = threading.Lock()
 
-    Resolution order per ticker:
-      1. Alpaca free real-time IEX feed (when API keys are set in .env)
-      2. yfinance ~15-minute delayed feed (fallback / international / OTC)
-      3. None / None if both fail
 
-    CASH is hard-coded to {"price": 1.00, "change": 0.0}.
-    """
+def _live_prices_from_store(tickers) -> dict:
+    """Return ``{ticker: record}`` for tickers whose cached price is still fresh."""
+    fresh = {}
+    now = time.monotonic()
+    with _live_price_lock:
+        for ticker in tickers:
+            entry = _live_price_store.get(ticker)
+            if entry is not None:
+                record, ts = entry
+                if (now - ts) < _LIVE_PRICE_TTL:
+                    fresh[ticker] = record
+    return fresh
+
+
+def _live_prices_to_store(records: dict) -> None:
+    now = time.monotonic()
+    with _live_price_lock:
+        for ticker, record in records.items():
+            _live_price_store[ticker] = (record, now)
+
+
+def _fetch_live_prices_network(tickers) -> dict:
+    """Batch-fetch prices for ``tickers`` (Alpaca real-time → yfinance fallback)."""
     prices = {}
-    real_tickers = []
-    for ticker in tickers:
-        if not ticker:
-            continue
-        if ticker.upper() == "CASH":
-            prices[ticker] = {"price": 1.00, "change": 0.0}
-            continue
-        real_tickers.append(ticker)
-
+    real_tickers = [t for t in tickers if t]
     if not real_tickers:
         return prices
 
@@ -937,6 +955,56 @@ def fetch_live_prices(tickers):
                 prices[ticker] = {"price": None, "change": None}
 
     return prices
+
+
+def fetch_live_prices(tickers):
+    """Return ``{ticker: {"price": float|None, "change": float|None}}``.
+
+    Backed by a per-ticker TTL store (see above) so overlapping ticker lists
+    requested by different tabs share warmed data — the first fetch of a symbol,
+    including the background prefetch at startup, serves every tab for the next
+    ``_LIVE_PRICE_TTL`` seconds regardless of which subset each tab asks for.
+
+    Resolution order per ticker:
+      1. Alpaca free real-time IEX feed (when API keys are set in .env)
+      2. yfinance ~15-minute delayed feed (fallback / international / OTC)
+      3. None / None if both fail
+
+    CASH is hard-coded to {"price": 1.00, "change": 0.0}.
+    """
+    prices = {}
+    real_tickers = []
+    for ticker in tickers:
+        if not ticker:
+            continue
+        if ticker.upper() == "CASH":
+            prices[ticker] = {"price": 1.00, "change": 0.0}
+            continue
+        real_tickers.append(ticker)
+
+    if not real_tickers:
+        return prices
+
+    cached = _live_prices_from_store(real_tickers)
+    prices.update(cached)
+
+    missing = [t for t in real_tickers if t not in cached]
+    if missing:
+        fetched = _fetch_live_prices_network(missing)
+        _live_prices_to_store(fetched)
+        prices.update(fetched)
+
+    return prices
+
+
+def _clear_live_prices() -> None:
+    """Bust the per-ticker store (used by the Dashboard/Market Watch refresh)."""
+    with _live_price_lock:
+        _live_price_store.clear()
+
+
+# Preserve the ``fetch_live_prices.clear()`` API the tabs already call.
+fetch_live_prices.clear = _clear_live_prices
 
 
 def live_price_feed_status(tickers: list[str] | None = None) -> dict:

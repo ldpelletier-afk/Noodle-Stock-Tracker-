@@ -44,30 +44,59 @@ def save_data(data: dict) -> None:
 
 
 def bg_prefetch(app_data: dict, deep: bool = False) -> None:
-    """Warm the most-touched caches. Called from app.py background thread and
-    from the Dashboard 'Power-load all' button (synchronous, with spinner)."""
-    _wl_tickers = sorted(
+    """Warm the most-touched caches so every tab lands instantly.
+
+    Called from the app entry point's startup thread and from the Dashboard
+    'Power-load all' button (synchronous, with spinner). The base pass warms
+    everything the Portfolio tabs read on landing — live prices for the whole
+    ticker universe, Market Watch's sparklines, and the Dashboard value chart.
+    ``deep=True`` additionally warms the macro / sentiment / library data used
+    by the heavier Analytics tabs."""
+    _wl_tickers = {
         t
         for items in app_data.get("watchlists", {}).values()
         for t in items
         if t and t.upper() != "CASH"
-    )
-    _fav_tickers = list(
+    }
+    _fav_tickers = {
         t
         for t in (app_data.get("favorites") or {}).keys()
         if t and t.upper() != "CASH"
-    )
-    if _wl_tickers:
+    }
+    _holding_tickers = {
+        t
+        for holdings in app_data.get("portfolios", {}).values()
+        for t in (holdings or {})
+        if t and t.upper() != "CASH"
+    }
+
+    # One batch call warms the per-ticker price store for *every* tab at once,
+    # regardless of which subset each tab later requests.
+    _universe = sorted(_wl_tickers | _fav_tickers | _holding_tickers)
+    if _universe:
         try:
-            fetch_live_prices(_wl_tickers)
-            fetch_sparkline_history(tuple(sorted(_wl_tickers)))
+            fetch_live_prices(_universe)
         except Exception:
             pass
-    if _fav_tickers:
+
+    # Market Watch 30-day sparklines — warm the exact tuple it requests so the
+    # st.cache_data key matches (Market Watch does not strip CASH/empties).
+    _mw_wl_tuple = tuple(sorted(
+        {t for items in app_data.get("watchlists", {}).values() for t in items}
+    ))
+    if _mw_wl_tuple:
         try:
-            fetch_live_prices(_fav_tickers)
+            fetch_sparkline_history(_mw_wl_tuple)
         except Exception:
             pass
+
+    # Dashboard's default 'All' portfolio-value chart (combined portfolios).
+    try:
+        from api import fetch_portfolio_value_history
+        fetch_portfolio_value_history(portfolio_name=None, days=365 * 5)
+    except Exception:
+        pass
+
     if not deep:
         return
     try:

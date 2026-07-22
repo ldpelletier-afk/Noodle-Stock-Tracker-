@@ -7,6 +7,7 @@ requirements-core.txt to run this alone.
 import threading as _threading
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 from ui.common import bg_prefetch, load_data
 
@@ -17,16 +18,24 @@ st.title("Noodle Stock Tracker: Portfolio")
 app_data = load_data()
 
 # ── Lazy-load session state ──────────────────────────────────────────────────
+# The startup prefetch (below) warms every tab's caches in the background, so
+# mark the live-data tabs ready up-front. Tabs then render live data on first
+# visit — served from the prefetched cache — instead of gating behind a manual
+# 'Power-load all' click on the Dashboard.
 if "_lazy_loaded" not in st.session_state:
-    st.session_state._lazy_loaded = set()
+    st.session_state._lazy_loaded = {"market_watch", "favorites", "asset_tracker"}
 
 
 # ── Background prefetch ──────────────────────────────────────────────────────
 if "_bg_prefetch_started" not in st.session_state:
     st.session_state._bg_prefetch_started = True
-    _threading.Thread(
+    _prefetch_thread = _threading.Thread(
         target=bg_prefetch, args=(app_data,), daemon=True
-    ).start()
+    )
+    # Attach the current script context so cache writes land in st.cache_data
+    # (the cache the tabs read) instead of the context-less fallback dict.
+    add_script_run_ctx(_prefetch_thread, get_script_run_ctx())
+    _prefetch_thread.start()
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
