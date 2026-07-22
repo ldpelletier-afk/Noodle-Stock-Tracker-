@@ -5,6 +5,7 @@ import streamlit as st
 from api import fetch_live_prices
 from data_store import (
     create_portfolio,
+    delete_portfolio,
     log_transaction,
     remove_holding,
     replace_portfolio_holdings,
@@ -171,6 +172,30 @@ def render(app_data: dict) -> None:
                         st.toast(f"Deleted {del_asset}", icon="🗑️")
                 else:
                     st.info("No assets.")
+
+        with st.expander("⚠️ Delete Portfolio", expanded=False):
+            st.warning(
+                f"This permanently deletes **{selected_portfolio}** and every "
+                "holding in it — for a clean wipe before uploading new "
+                "holdings. This cannot be undone from here."
+            )
+            confirm_name = st.text_input(
+                f"Type **{selected_portfolio}** to confirm",
+                key=f"del_portfolio_confirm_{selected_portfolio}",
+                placeholder=selected_portfolio,
+            )
+            if st.button(
+                "🗑️ Delete Portfolio Permanently",
+                type="primary",
+                disabled=(confirm_name != selected_portfolio),
+                key=f"del_portfolio_btn_{selected_portfolio}",
+            ):
+                delete_portfolio(selected_portfolio)
+                del portfolios[selected_portfolio]
+                app_data["portfolios"] = portfolios
+                _invalidate_app_data()
+                st.toast(f"Deleted portfolio '{selected_portfolio}'", icon="🗑️")
+                st.rerun()
 
     if current_holdings:
         holding_tickers = list(current_holdings.keys())
