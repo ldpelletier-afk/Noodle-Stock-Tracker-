@@ -1,0 +1,11 @@
+streamlit
+yfinance
+pandas
+requests
+plotly
+python-dotenv
+beautifulsoup4
+numpy
+
+# FRED economic data
+fredapi
