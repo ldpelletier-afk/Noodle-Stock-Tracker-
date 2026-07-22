@@ -79,10 +79,24 @@ def render(app_data: dict) -> None:
             "🏠 Dashboard tab to populate prices, sparklines, and the calendar."
         )
     else:
-        with st.spinner("Fetching live market data..."):
-            live_prices = fetch_live_prices(all_wl_tickers)
-        with st.spinner("Loading 30-day trends..."):
-            _sparklines = fetch_sparkline_history(tuple(sorted(all_wl_tickers)))
+        # Session-scoped stores: once a ticker's price/sparkline is fetched this
+        # session, every later visit to this tab reuses it instead of
+        # re-fetching — even after the underlying TTL cache in api.py expires.
+        # Only tickers newly added to a watchlist trigger a fetch. Use the
+        # Dashboard's "🔄 Refresh live data" button to force a full refresh.
+        _price_store = st.session_state.setdefault("_mw_price_store", {})
+        _missing_prices = [t for t in all_wl_tickers if t not in _price_store]
+        if _missing_prices:
+            with st.spinner("Fetching live market data..."):
+                _price_store.update(fetch_live_prices(_missing_prices))
+        live_prices = _price_store
+
+        _spark_store = st.session_state.setdefault("_mw_spark_store", {})
+        _missing_sparks = [t for t in all_wl_tickers if t not in _spark_store]
+        if _missing_sparks:
+            with st.spinner("Loading 30-day trends..."):
+                _spark_store.update(fetch_sparkline_history(tuple(sorted(_missing_sparks))))
+        _sparklines = _spark_store
 
     crashing_assets = [
         f"**{t}** ({live_prices.get(t, {}).get('change', 0):.2f}%)"
@@ -99,8 +113,12 @@ def render(app_data: dict) -> None:
     if all_wl_tickers:
         with st.expander("📅 Upcoming Calendar (next 60 days)", expanded=False):
             if _mw_ready:
-                with st.spinner("Loading earnings + dividend dates..."):
-                    _cal_df = fetch_calendar_events(tuple(sorted(all_wl_tickers)))
+                _cal_ticker_key = tuple(sorted(all_wl_tickers))
+                if st.session_state.get("_mw_cal_tickers") != _cal_ticker_key:
+                    with st.spinner("Loading earnings + dividend dates..."):
+                        st.session_state["_mw_cal_df"] = fetch_calendar_events(_cal_ticker_key)
+                    st.session_state["_mw_cal_tickers"] = _cal_ticker_key
+                _cal_df = st.session_state["_mw_cal_df"]
                 if _cal_df is None or _cal_df.empty:
                     st.caption(
                         "No upcoming earnings or ex-dividend dates found in the next "
@@ -361,6 +379,9 @@ def render(app_data: dict) -> None:
         if st.button("🔄 Force Refresh Data", use_container_width=True):
             fetch_stock_details.clear()
             fetch_live_prices.clear()
+            for _k in ("_mw_price_store", "_mw_spark_store", "_mw_cal_df", "_mw_cal_tickers"):
+                st.session_state.pop(_k, None)
+            st.rerun()
 
     timeframes = ["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "Max"]
     selected_period = st.radio("Timeframe", timeframes, index=2, horizontal=True)

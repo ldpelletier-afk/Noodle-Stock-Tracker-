@@ -31,6 +31,10 @@ def render(app_data: dict) -> None:
                     fetch_calendar_events.clear()
                 except Exception:
                     pass
+                # Market Watch caches these per-session (see ui/market_watch.py)
+                # to avoid re-fetching on every tab switch — bust that too.
+                for _k in ("_mw_price_store", "_mw_spark_store", "_mw_cal_df", "_mw_cal_tickers"):
+                    st.session_state.pop(_k, None)
                 st.rerun()
         else:
             if st.button("⚡ Power-load all", key="dash_load_btn",
