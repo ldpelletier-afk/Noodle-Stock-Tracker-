@@ -38,8 +38,15 @@ def render(app_data: dict) -> None:
         st.info("Please create a portfolio to get started.")
         st.stop()
 
+    # A widget's session_state value can't be reassigned after it's been
+    # instantiated — so a just-deleted portfolio resets the picker via this
+    # flag on the *next* rerun, checked here before the widget is created.
+    if st.session_state.pop("_at_reset_portfolio_picker", False):
+        st.session_state["at_selected_portfolio"] = "All Portfolios"
+
     selected_portfolio = st.selectbox(
-        "Select Portfolio to View", ["All Portfolios"] + portfolio_names
+        "Select Portfolio to View", ["All Portfolios"] + portfolio_names,
+        key="at_selected_portfolio",
     )
 
     current_holdings = {}
@@ -179,21 +186,24 @@ def render(app_data: dict) -> None:
                 "holding in it — for a clean wipe before uploading new "
                 "holdings. This cannot be undone from here."
             )
-            confirm_name = st.text_input(
-                f"Type **{selected_portfolio}** to confirm",
+            confirm_checked = st.checkbox(
+                f"Yes, permanently delete '{selected_portfolio}' and all its holdings",
                 key=f"del_portfolio_confirm_{selected_portfolio}",
-                placeholder=selected_portfolio,
             )
             if st.button(
                 "🗑️ Delete Portfolio Permanently",
                 type="primary",
-                disabled=(confirm_name != selected_portfolio),
+                disabled=not confirm_checked,
                 key=f"del_portfolio_btn_{selected_portfolio}",
             ):
                 delete_portfolio(selected_portfolio)
                 del portfolios[selected_portfolio]
                 app_data["portfolios"] = portfolios
                 _invalidate_app_data()
+                # Flag the picker to reset on the next run (see top of
+                # render()) so it shows "All Portfolios" immediately instead
+                # of briefly re-showing the now-deleted portfolio.
+                st.session_state["_at_reset_portfolio_picker"] = True
                 st.toast(f"Deleted portfolio '{selected_portfolio}'", icon="🗑️")
                 st.rerun()
 
